@@ -3,6 +3,9 @@
 ## [Unreleased]
 
 ### Added
+- File menu (File → New / Open… / Save / Save As…) for managing named config profiles
+- Keyboard shortcuts: Ctrl+N (New), Ctrl+O (Open), Ctrl+S (Save), Ctrl+Shift+S (Save As)
+- Title bar shows the active config filename when a non-default file is loaded
 
 ### Changed
 

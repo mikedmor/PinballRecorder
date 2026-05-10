@@ -24,7 +24,7 @@ You can create additional named config files (e.g. per-table configs for PinUP P
 
   // Audio capture device name as shown in the app dropdown
   // Use "[Loopback] " prefix for WASAPI loopback devices
-  "audio_device": "[Loopback] Speakers (Razer Kraken V4 Pro - Game)",
+  "audio_device": "[Loopback] Speakers (USB Device)",
 
   // Window title to bring to foreground before recording starts (optional)
   "window_title": "",

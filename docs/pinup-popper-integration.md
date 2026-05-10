@@ -132,7 +132,7 @@ The recorder window **is still visible** in headless mode — it shows the log o
   "file_prefix": "pinball",
   "ffmpeg_path": "C:\\vPinball\\PinballRecorder\\ffmpeg.exe",
   "audio_enabled": true,
-  "audio_device": "[Loopback] Speakers (Razer Kraken V4 Pro - Game)",
+  "audio_device": "[Loopback] Speakers (USB Device)",
   "window_title": "",
   "screens": {
     "Playfield": {

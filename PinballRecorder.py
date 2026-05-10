@@ -243,11 +243,12 @@ class PinballRecorder(tk.Tk):
 
     def __init__(self, cli_config=None, headless=False):
         super().__init__()
-        self.title("🎯 Pinball Screen Recorder")
         self.configure(bg=BG)
         self.resizable(False, False)
 
         self._headless  = headless
+        # Track which config file is currently loaded (None = default)
+        self._config_path = None if cli_config is None else getattr(cli_config, "_path", None)
         # CLI config overrides the saved config when provided
         self.cfg        = cli_config if cli_config is not None else load_config()
         self.processes  = []
@@ -260,6 +261,8 @@ class PinballRecorder(tk.Tk):
 
         self._apply_styles()
         self._build_ui()
+        self._build_menu()
+        self._update_title()
         self._refresh_windows()
         self._refresh_audio_devices()
 
@@ -327,6 +330,119 @@ class PinballRecorder(tk.Tk):
         self._build_window_section(main, PAD)
         self._build_controls(main, PAD)
         self._build_log(main)
+
+    def _build_menu(self):
+        menubar = tk.Menu(self, bg=FRAME_BG, fg=FG, activebackground=ACCENT,
+                          activeforeground=BG, relief="flat", tearoff=False)
+        file_menu = tk.Menu(menubar, bg=FRAME_BG, fg=FG, activebackground=ACCENT,
+                            activeforeground=BG, relief="flat", tearoff=False)
+        file_menu.add_command(label="New",         accelerator="Ctrl+N", command=self._cmd_new)
+        file_menu.add_command(label="Open…",       accelerator="Ctrl+O", command=self._cmd_open)
+        file_menu.add_separator()
+        file_menu.add_command(label="Save",        accelerator="Ctrl+S", command=self._cmd_save)
+        file_menu.add_command(label="Save As…",    accelerator="Ctrl+Shift+S", command=self._cmd_save_as)
+        menubar.add_cascade(label="File", menu=file_menu)
+        self.config(menu=menubar)
+        self.bind_all("<Control-n>", lambda _: self._cmd_new())
+        self.bind_all("<Control-o>", lambda _: self._cmd_open())
+        self.bind_all("<Control-s>", lambda _: self._cmd_save())
+        self.bind_all("<Control-S>", lambda _: self._cmd_save_as())
+
+    def _update_title(self):
+        if self._config_path:
+            name = os.path.basename(self._config_path)
+            self.title(f"🎯 Pinball Screen Recorder  —  {name}")
+        else:
+            self.title("🎯 Pinball Screen Recorder")
+
+    def _apply_config(self, cfg, path=None):
+        """Load cfg dict into all UI widgets and update state."""
+        self.cfg = cfg
+        self._config_path = path
+        for name in SCREENS:
+            v  = self.screen_vars[name]
+            sc = cfg.get("screens", {}).get(name, {})
+            v["enabled"].set(sc.get("enabled", True))
+            v["monitor"].set(sc.get("monitor", ""))
+            v["x"].set(str(sc.get("x", 0)))
+            v["y"].set(str(sc.get("y", 0)))
+            v["width"].set(str(sc.get("width", 1920)))
+            v["height"].set(str(sc.get("height", 1080)))
+            v["fps"].set(str(sc.get("fps", 30)))
+            v["delay"].set(str(sc.get("delay", 0)))
+            v["duration"].set(str(sc.get("duration", 0)))
+        self.output_folder_var.set(cfg.get("output_folder", ""))
+        self.prefix_var.set(cfg.get("file_prefix", "pinball"))
+        self.ffmpeg_var.set(cfg.get("ffmpeg_path", "") or self.ffmpeg_path)
+        self.audio_enabled.set(cfg.get("audio_enabled", True))
+        self.audio_device_var.set(cfg.get("audio_device", ""))
+        self.window_var.set(cfg.get("window_title", ""))
+        self._update_title()
+        self._log(f"Config loaded: {path or '(default)'}")
+
+    def _cmd_new(self):
+        """Reset all settings to defaults."""
+        if self.recording:
+            return
+        if not messagebox.askyesno("New Config",
+                                   "Discard current settings and load defaults?",
+                                   parent=self):
+            return
+        self._apply_config(dict(DEFAULT_CONFIG), path=None)
+
+    def _cmd_open(self):
+        """Browse for a JSON config file and load it."""
+        if self.recording:
+            return
+        path = filedialog.askopenfilename(
+            title="Open Config",
+            initialdir=_APP_DIR,
+            filetypes=[("JSON config", "*.json"), ("All files", "*.*")],
+            parent=self,
+        )
+        if not path:
+            return
+        try:
+            with open(path) as f:
+                cfg = json.load(f)
+            for k, v in DEFAULT_CONFIG.items():
+                cfg.setdefault(k, v)
+        except Exception as e:
+            messagebox.showerror("Open Failed", str(e), parent=self)
+            return
+        self._apply_config(cfg, path=path)
+
+    def _cmd_save(self):
+        """Save to the current file, or fall through to Save As."""
+        if self._config_path:
+            try:
+                with open(self._config_path, "w") as f:
+                    json.dump(self._snapshot_config(), f, indent=2)
+                self._log(f"Saved: {self._config_path}")
+            except Exception as e:
+                messagebox.showerror("Save Failed", str(e), parent=self)
+        else:
+            self._cmd_save_as()
+
+    def _cmd_save_as(self):
+        """Save to a new file chosen by the user."""
+        path = filedialog.asksaveasfilename(
+            title="Save Config As",
+            initialdir=_APP_DIR,
+            defaultextension=".json",
+            filetypes=[("JSON config", "*.json"), ("All files", "*.*")],
+            parent=self,
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w") as f:
+                json.dump(self._snapshot_config(), f, indent=2)
+            self._config_path = path
+            self._update_title()
+            self._log(f"Saved as: {path}")
+        except Exception as e:
+            messagebox.showerror("Save Failed", str(e), parent=self)
 
     def _build_screen_section(self, parent, pad):
         frame = ttk.LabelFrame(parent, text="  Screen Configuration  ", padding=pad)

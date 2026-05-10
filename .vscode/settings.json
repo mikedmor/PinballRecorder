@@ -1,0 +1,28 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^c:\\\\vPinball\\\\PinballRecorder\\\\\\.venv\\\\Scripts\\\\pyinstaller\\.exe PinballRecorder\\.spec$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^c:\\\\vPinball\\\\PinballRecorder\\\\\\.venv\\\\Scripts\\\\python\\.exe -c \"import ast; ast\\.parse\\(open\\('PinballRecorder\\.py', encoding='utf-8'\\)\\.read\\(\\)\\); print\\('Syntax OK'\\)\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^c:\\\\vPinball\\\\PinballRecorder\\\\\\.venv\\\\Scripts\\\\python\\.exe -c \"import ast; ast\\.parse\\(open\\('PinballRecorder\\.py', encoding='utf-8'\\)\\.read\\(\\)\\); print\\('OK'\\)\" ; c:\\\\vPinball\\\\PinballRecorder\\\\\\.venv\\\\Scripts\\\\pyinstaller\\.exe PinballRecorder\\.spec$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^\\.venv\\\\Scripts\\\\pyinstaller\\.exe PinballRecorder\\.spec 2>&1 \\| Select-String -Pattern \"ERROR\\|WARNING\\|completed\\|built\" \\| Select-Object -Last 20$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^\\.venv\\\\Scripts\\\\pyinstaller\\.exe PinballRecorder\\.spec 2>&1 \\| Select-String -Pattern \"ERROR\\|completed\\|built\" \\| Select-Object -Last 10$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^\\$lines = Get-Content C:\\\\vPinball\\\\PinballRecorder\\\\build_release\\.bat ; \\$lines\\[0\\.\\.183\\] \\| Set-Content C:\\\\vPinball\\\\PinballRecorder\\\\build_release\\.bat -Encoding UTF8 ; \\(Get-Content C:\\\\vPinball\\\\PinballRecorder\\\\build_release\\.bat \\| Measure-Object -Line\\)\\.Lines$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}

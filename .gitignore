@@ -1,0 +1,10 @@
+dist/*
+build/*
+release/
+build_release.bat
+get_version.ps1
+update_changelog.ps1
+add_unreleased.ps1
+strip_unreleased.ps1
+PinballRecorder-*.zip
+.github/copilot-instructions.md

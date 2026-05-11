@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [v2.0.0] - 2026-05-11
 
 ### Added
 - Default recording duration changed from 0 (unlimited) to 20 seconds for all screens — safer out-of-the-box behaviour

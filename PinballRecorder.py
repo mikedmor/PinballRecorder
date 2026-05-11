@@ -209,7 +209,7 @@ PINUP_DB_SEARCH_PATHS = [
 PINUP_SCREEN_FOLDERS = {
     "Playfield": "PlayField",
     "Backglass": "BackGlass",
-    "FullDMD":   "DMD",
+    "FullDMD":   "Menu",
     "Audio":     "Audio",
 }
 
@@ -2177,19 +2177,55 @@ class PinballRecorder(tk.Tk):
             return
 
         self.after(0, self._set_status, "🔴  Recording…", BTN_RED)
-        self._launch_ffmpeg(cfg)
 
-    def _launch_ffmpeg(self, cfg):
+        # Find the earliest moment any stream starts so we can beep 1s before it.
+        enabled_delays = [cfg["screens"][n].get("delay", 0)
+                          for n in SCREENS if cfg["screens"][n].get("enabled")]
+        if cfg.get("audio_enabled"):
+            enabled_delays.append(cfg.get("audio_delay", 0))
+        first_start = min(enabled_delays) if enabled_delays else 0
+
+        pre_beep = max(0.0, first_start - 1.0)
+        if pre_beep > 0:
+            time.sleep(pre_beep)
+
+        try:
+            import winsound
+            winsound.Beep(880, 200)   # short high beep – recording about to start
+        except Exception:
+            pass
+
+        post_beep = first_start - pre_beep  # 0.0 or 1.0
+        if post_beep > 0:
+            time.sleep(post_beep)
+
+        # t_ref marks the logical zero of the recording timeline. Per-screen delays
+        # inside _launch_ffmpeg are measured from this point; any time already
+        # consumed above is accounted for by setting t_ref = now - first_start.
+        t_ref = time.time() - first_start
+        self._launch_ffmpeg(cfg, t_ref)
+
+    def _launch_ffmpeg(self, cfg, t_ref=None):
         ffmpeg    = self.ffmpeg_path
         ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
         prefix    = cfg["file_prefix"]
         out_dir   = cfg["output_folder"]
+        # t_ref: the logical moment when all delays are measured from.
+        # Callers that pre-consume part of the delay (e.g. the start-beep sleep)
+        # pass their reference time so remaining per-screen delays are correct.
+        t_ref     = t_ref if t_ref is not None else time.time()
 
         self.processes       = []
         self._recording_files = {}   # screen_name -> output path
         self._recording_cfg   = cfg  # snapshot used for post-recording actions
 
+        import collections
+        proc_lock    = threading.Lock()
+        ready_events = []
+
         # ── Video streams ──────────────────────────────────────────────────────
+        # Each screen starts in its own thread so their delays run in parallel
+        # and each stream begins at the correct time relative to t_ref.
         for name in SCREENS:
             s = cfg["screens"][name]
             if not s["enabled"]:
@@ -2217,29 +2253,46 @@ class PinballRecorder(tk.Tk):
                 out_file,
             ]
 
-            self._log(f"▶ {name}  →  {os.path.basename(out_file)}")
-            try:
-                proc = self._ffmpeg_popen(
-                    cmd,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
-                )
-                # Drain stderr in background so the pipe buffer never fills up
-                import collections
-                err_buf = collections.deque(maxlen=120)
-                def _drain(p=proc, b=err_buf):
-                    try:
-                        for raw in p.stderr:
-                            b.append(raw.decode(errors="replace").rstrip())
-                    except Exception:
-                        pass
-                threading.Thread(target=_drain, daemon=True).start()
-                self.processes.append({"name": name, "proc": proc,
-                                       "file": out_file, "err_buf": err_buf})
-                self._recording_files[name] = out_file
-            except Exception as e:
-                self._log(f"  ERROR starting {name}: {e}")
+            ready = threading.Event()
+            ready_events.append(ready)
+
+            def _start_screen(sname=name, scfg=s, _cmd=cmd, ofile=out_file, evt=ready):
+                dly = scfg.get("delay", 0)
+                if dly > 0:
+                    remaining = max(0.0, dly - (time.time() - t_ref))
+                    if remaining > 0:
+                        time.sleep(remaining)
+                self._log(f"▶ {sname}  →  {os.path.basename(ofile)}")
+                try:
+                    proc = self._ffmpeg_popen(
+                        _cmd,
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                    )
+                    # Drain stderr in background so the pipe buffer never fills up
+                    err_buf = collections.deque(maxlen=120)
+                    def _drain(p=proc, b=err_buf):
+                        try:
+                            for raw in p.stderr:
+                                b.append(raw.decode(errors="replace").rstrip())
+                        except Exception:
+                            pass
+                    threading.Thread(target=_drain, daemon=True).start()
+                    with proc_lock:
+                        self.processes.append({"name": sname, "proc": proc,
+                                               "file": ofile, "err_buf": err_buf})
+                        self._recording_files[sname] = ofile
+                except Exception as e:
+                    self._log(f"  ERROR starting {sname}: {e}")
+                finally:
+                    evt.set()
+
+            threading.Thread(target=_start_screen, daemon=True).start()
+
+        # Wait for all screen launch threads to complete before starting audio
+        for evt in ready_events:
+            evt.wait(timeout=120)
 
         # ── Audio stream ──────────────────────────────────────────────────────────
         # Resolve audio delay and duration from config
@@ -2260,8 +2313,10 @@ class PinballRecorder(tk.Tk):
             loopback_meta = getattr(self, "_loopback_meta", {})
 
             if aud_delay > 0:
-                self._log(f"  delay: {aud_delay}s")
-                time.sleep(aud_delay)
+                aud_remaining = max(0.0, aud_delay - (time.time() - t_ref))
+                if aud_remaining > 0:
+                    self._log(f"  delay: {aud_remaining:.0f}s")
+                    time.sleep(aud_remaining)
 
             if device in loopback_meta:
                 # ── WASAPI loopback via pyaudiowpatch ────────────────────────
@@ -2275,29 +2330,51 @@ class PinballRecorder(tk.Tk):
                     import pyaudiowpatch as pyaudio
                     import wave
                     CHUNK = 1024
-                    pa = pyaudio.PyAudio()
-                    stream = pa.open(format=pyaudio.paInt16,
-                                     channels=ch,
-                                     rate=rate,
-                                     input=True,
-                                     input_device_index=idx,
-                                     frames_per_buffer=CHUNK)
-                    frames = []
-                    start = time.time()
                     try:
-                        while not stop.is_set():
-                            if dur > 0 and (time.time() - start) >= dur:
-                                break
-                            frames.append(stream.read(CHUNK, exception_on_overflow=False))
-                    finally:
-                        stream.stop_stream()
-                        stream.close()
-                        pa.terminate()
-                    with wave.open(wav_path, "wb") as wf:
-                        wf.setnchannels(ch)
-                        wf.setsampwidth(2)  # paInt16 = 2 bytes
-                        wf.setframerate(rate)
-                        wf.writeframes(b"".join(frames))
+                        pa = pyaudio.PyAudio()
+                        frames = []
+
+                        # Callback-mode capture: PortAudio fills frames on its own
+                        # thread so our loop never blocks. This means stop_evt
+                        # terminates the thread within one sleep(0.05) cycle instead
+                        # of blocking indefinitely inside stream.read().
+                        def _cb(in_data, frame_count, time_info, status):
+                            frames.append(in_data)
+                            return (None, pyaudio.paContinue)
+
+                        stream = pa.open(format=pyaudio.paInt16,
+                                         channels=ch,
+                                         rate=rate,
+                                         input=True,
+                                         input_device_index=idx,
+                                         frames_per_buffer=CHUNK,
+                                         stream_callback=_cb)
+                        stream.start_stream()
+                        t0 = time.time()
+                        try:
+                            while not stop.is_set() and stream.is_active():
+                                if dur > 0 and (time.time() - t0) >= dur:
+                                    break
+                                time.sleep(0.05)
+                        finally:
+                            stream.stop_stream()
+                            stream.close()
+                            pa.terminate()
+
+                        if not frames:
+                            self.after(0, self._log,
+                                       "  ⚠ No audio data captured – device may not "
+                                       "be producing audio (check device selection)")
+                        with wave.open(wav_path, "wb") as wf:
+                            wf.setnchannels(ch)
+                            wf.setsampwidth(2)  # paInt16 = 2 bytes
+                            wf.setframerate(rate)
+                            wf.writeframes(b"".join(frames))
+                        self.after(0, self._log,
+                                   f"  WAV captured: {len(frames)} chunk(s), "
+                                   f"{os.path.getsize(wav_path):,} bytes")
+                    except Exception as exc:
+                        self.after(0, self._log, f"  ⚠ WASAPI capture error: {exc}")
 
                 t = threading.Thread(target=_record_loopback, daemon=True)
                 t.start()
@@ -2406,11 +2483,16 @@ class PinballRecorder(tk.Tk):
                 if wav and os.path.exists(wav):
                     self.after(0, self._log, "  Converting WAV → MP3…")
                     try:
-                        subprocess.run(
+                        r = subprocess.run(
                             [ffmpeg_bin, "-y", "-i", wav, "-q:a", "2", path],
                             capture_output=True, timeout=120,
                             creationflags=subprocess.CREATE_NO_WINDOW,
                         )
+                        if r.returncode != 0:
+                            err_txt = r.stderr.decode(errors="replace").strip()
+                            self.after(0, self._log,
+                                       f"  ⚠ WAV→MP3 failed (code {r.returncode}): "
+                                       f"{err_txt[-200:] if err_txt else '(no output)'}")
                     except Exception as e:
                         self.after(0, self._log, f"  WAV→MP3 error: {e}")
                     finally:
@@ -2418,6 +2500,9 @@ class PinballRecorder(tk.Tk):
                             os.remove(wav)
                         except Exception:
                             pass
+                else:
+                    self.after(0, self._log,
+                               "  ⚠ WAV file not found – WASAPI capture likely failed")
             else:  # ── FFmpeg subprocess ──
                 saved = False
                 try:
@@ -2495,6 +2580,14 @@ class PinballRecorder(tk.Tk):
         self.stop_btn.configure(state="disabled")
         self._set_status("✅  Done – files saved!", "#a6e3a1")
         self._log("─" * 48)
+
+        # Play a completion sound so the user notices even if the window is in the background
+        try:
+            import winsound
+            for freq, dur in [(523, 150), (659, 150), (784, 300)]:
+                winsound.Beep(freq, dur)
+        except Exception:
+            pass
 
         rec_cfg = self._recording_cfg
         # Move files to PinUP capture folder structure if configured

@@ -3,10 +3,18 @@
 ## [Unreleased]
 
 ### Added
+- **Start beep**: a short 880 Hz tone plays 1 second before the first recording stream begins, giving audible notice that recording is imminent (the 1-second gap keeps the beep out of the captured audio)
+- **Done chime**: a three-note ascending tone plays when all video and audio recordings have finished, so the user is notified even when the window is in the background
 
 ### Changed
+- **FullDMD PinUP folder**: recordings are now filed into the `Menu` folder instead of `DMD` to match PinUP Popper's actual capture folder naming
+- **Per-screen recording delay now honoured**: each screen's delay is measured from a shared reference time and runs in parallel (threads), so all screens start at their configured moment rather than ignoring the delay entirely
+- **Audio delay uses shared time reference**: the audio delay is now computed relative to the same start reference as the video streams, so if the pre-beep countdown already consumed part of the delay, no extra wait is added
 
 ### Fixed
+- WASAPI loopback capture errors (e.g. device failing to open) are now caught and logged instead of silently producing an empty/missing audio file
+- WAV→MP3 conversion failures now log the FFmpeg return code and last error output instead of appearing as a silent "May be incomplete" warning
+- When the WAV intermediate file is not found after capture, the log now explicitly reports "WASAPI capture likely failed" instead of giving no explanation
 
 ## [v2.1.0] - 2026-05-11
 

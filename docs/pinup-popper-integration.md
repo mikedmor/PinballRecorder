@@ -12,10 +12,10 @@ PinballRecorder connects directly to PinUP Popper's database (`PUPDatabase.db`) 
 - Preview the exact destination file paths before recording
 - Automatically move (or copy) recorded files into the correct POPMedia folder structure after recording
 
-It also supports **headless mode** via command-line arguments for fully automated recording:
+It also supports **headless mode** via command-line arguments for fully automated recording — a config file is optional since all settings can be supplied as arguments:
 
 ```
-PinballRecorder.exe --config "path\to\config.json" --autostart
+PinballRecorder.exe --autostart --rom tz_ps3 --duration 30
 ```
 
 ---
@@ -72,13 +72,22 @@ After selecting a table, use **File → Save As…** — the file dialog will su
 ### Command-Line Arguments
 
 ```
-PinballRecorder.exe [--config PATH] [--autostart]
+PinballRecorder.exe [--config PATH] [--autostart] [options…]
 ```
 
 | Argument | Description |
 |----------|-------------|
-| `--config PATH` | Load a specific JSON config file |
+| `--config PATH` | Base JSON config file (optional — defaults to saved config) |
 | `--autostart` | Start recording immediately on launch and exit when done |
+| `--rom NAME` | PinUP ROM name — selects the table and routes output to the correct POPMedia folder |
+| `--duration SECS` | Recording duration for all enabled screens |
+| `--delay SECS` | Start delay for all enabled screens |
+| `--output-folder PATH` | Output folder for temporary recording files |
+| `--audio-enabled 0\|1` | Enable or disable audio recording |
+| `--screen-<name>-duration SECS` | Duration for a specific screen (`playfield`, `backglass`, `fulldmd`) |
+| `--screen-<name>-enabled 0\|1` | Enable or disable a specific screen |
+
+See [README.md](../README.md#cli--headless-mode) for the full argument reference.
 
 ### Headless Mode Behaviour
 
@@ -95,23 +104,32 @@ The recorder window is still visible in headless mode — it shows log output an
 
 ## PinUP Popper Automation Setup
 
-### Step 1: Configure and Save a Per-Table Config
+### Step 1: Configure your base settings
 
 1. Launch PinballRecorder normally
-2. Set up your screen regions and audio device
-3. Select your table from the **Table / ROM** dropdown in the PinUP section
-4. Use **File → Save As…** — it will suggest the ROM name (e.g. `tz_ps3.json`)
-5. Save the config next to `PinballRecorder.exe`
+2. Set up your screen regions, audio device, and output folder
+3. Use **File → Save** — this saves to `configs/default_config.json`, which headless mode will use when no `--config` is specified
 
-Ensure each enabled screen has a non-zero `duration` for headless mode:
+Ensure each enabled screen has a non-zero `duration`:
 
 ```json
 "Playfield": { "enabled": true, "duration": 30, ... }
 ```
 
+Or supply `--duration` on the command line (overrides any value in the config file).
+
 ### Step 2: Create a Capture Script
 
-Create a batch file `capture_table.bat`:
+There are two approaches. **Option A** (simplest) — pass `--rom` directly, no per-table config files needed:
+
+```bat
+@echo off
+:: capture_table.bat — called by PinUP Popper with the ROM name as %1
+set RECORDER=C:\vPinball\PinballRecorder\PinballRecorder.exe
+"%RECORDER%" --autostart --rom %1 --duration 30
+```
+
+**Option B** — per-table config files (useful if individual tables need different screen layouts):
 
 ```bat
 @echo off
@@ -126,7 +144,7 @@ if not exist "%CONFIG%" (
 "%RECORDER%" --config "%CONFIG%" --autostart
 ```
 
-Call it from PinUP Popper with the ROM name as the argument:
+Call either script from PinUP Popper with the ROM name as the argument:
 
 ```
 capture_table.bat tz_ps3
@@ -144,13 +162,11 @@ In PinUP Popper, add a **Table Launch Script** or use **Game Manager → Script*
 Shell "C:\vPinball\PinballRecorder\capture_table.bat tz_ps3"
 ```
 
-Or use a **shared config** for all tables and rely on the built-in PinUP integration to move files to the correct location automatically — in that case one config file works for all tables:
+Or call the exe directly with `--rom` — no batch file required:
 
 ```
-Shell "C:\vPinball\PinballRecorder\PinballRecorder.exe --config C:\vPinball\PinballRecorder\popper_capture.json --autostart"
+Shell "C:\vPinball\PinballRecorder\PinballRecorder.exe --autostart --rom tz_ps3 --duration 30"
 ```
-
-> **Tip:** When using a shared config with the PinUP integration, open the GUI first, select the correct table in the PinUP section, and save the config. PinballRecorder remembers the selected table and will use it in headless mode.
 
 ---
 

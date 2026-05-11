@@ -15,7 +15,7 @@ Built with Python + tkinter. Distributed as a single `.exe` with no installation
 - **Monitor auto-detection** — automatically maps screens to connected monitors on first run
 - **Named config profiles** — File → New / Open / Save / Save As to manage multiple config files (e.g. per-table or per-emulator)
 - **PinUP Popper Integration** — select a table from PUPDatabase, preview destination paths, and automatically move recordings into the correct POPMedia folder structure after recording
-- **CLI / headless mode** — launch with a JSON config and `--autostart` to record and exit automatically
+- **CLI / headless mode** — launch with `--autostart` and optional JSON config; all config values can be supplied as command-line arguments so no config file is required for automation
 - **Portable** — runs from a USB drive, no install required
 - **Config persistence** — session settings auto-saved to `default_config.json` next to the `.exe`; global preferences stored in `global.json`
 
@@ -134,15 +134,70 @@ See [docs/pinup-popper-integration.md](docs/pinup-popper-integration.md) for ful
 ## CLI / Headless Mode
 
 ```
-PinballRecorder.exe [--config PATH] [--autostart]
+PinballRecorder.exe [--config PATH] [--autostart] [options…]
 ```
+
+CLI arguments override individual config values, so a JSON file is optional — you can drive everything from the command line alone.
+
+### Core arguments
 
 | Argument | Description |
 |----------|-------------|
-| `--config PATH` | Load a specific JSON config file instead of `default_config.json` |
+| `--config PATH` | Base JSON config file to load (defaults to saved config when `--autostart` is used without `--config`) |
 | `--autostart` | Start recording immediately on launch and exit when done |
 
-> When using `--autostart`, set a non-zero `duration` on each enabled screen. If all durations are 0, headless mode defaults to **20 seconds** per screen as a safety guard.
+### Config overrides
+
+| Argument | Description |
+|----------|-------------|
+| `--output-folder PATH` | Output folder for recordings |
+| `--file-prefix STR` | Filename prefix |
+| `--rom NAME` | PinUP ROM/game name — selects the table and auto-routes output to the correct POPMedia folder |
+| `--window-title STR` | Window title to focus before recording starts |
+| `--delay SECS` | Start delay applied to **all** enabled screens |
+| `--duration SECS` | Duration applied to **all** enabled screens |
+
+### Audio overrides
+
+| Argument | Description |
+|----------|-------------|
+| `--audio-enabled 0\|1` | Enable or disable audio recording |
+| `--audio-device NAME` | Audio capture device name |
+| `--audio-delay SECS` | Audio start delay in seconds |
+| `--audio-duration SECS` | Audio duration in seconds |
+
+### Per-screen overrides
+
+Replace `<screen>` with `playfield`, `backglass`, or `fulldmd`:
+
+| Argument | Description |
+|----------|-------------|
+| `--screen-<screen>-enabled 0\|1` | Enable or disable this screen |
+| `--screen-<screen>-x PX` | Left edge of capture region |
+| `--screen-<screen>-y PX` | Top edge of capture region |
+| `--screen-<screen>-width PX` | Capture region width |
+| `--screen-<screen>-height PX` | Capture region height |
+| `--screen-<screen>-fps FPS` | Frame rate |
+| `--screen-<screen>-delay SECS` | Start delay for this screen only |
+| `--screen-<screen>-duration SECS` | Duration for this screen only |
+
+### Examples
+
+```bat
+:: Record all screens for 30s using the saved default config
+PinballRecorder.exe --autostart --duration 30
+
+:: Record a specific PinUP table for 30s, no config file needed
+PinballRecorder.exe --autostart --rom tz_ps3 --duration 30
+
+:: Record only the Backglass for 20s
+PinballRecorder.exe --autostart --screen-playfield-enabled 0 --screen-fulldmd-enabled 0 --duration 20
+
+:: Override individual screen duration alongside a base config
+PinballRecorder.exe --config base.json --autostart --screen-playfield-duration 60 --screen-backglass-duration 30
+```
+
+> When using `--autostart`, each enabled screen must have a non-zero duration (set via `--duration`, `--screen-<name>-duration`, or the config file). If all durations are 0, headless mode defaults to **20 seconds** per screen as a safety guard.
 
 ---
 

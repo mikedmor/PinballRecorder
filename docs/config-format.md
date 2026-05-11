@@ -57,9 +57,6 @@ These fields are saved and loaded with each config profile:
   // When false (default), files are MOVED to POPMedia
   "pinup_also_save": false,
 
-  // ── Recent files list (managed automatically) ─────────────────────────────
-  "recent_files": [],
-
   // ── Per-screen configuration ──────────────────────────────────────────────
   "screens": {
     "Playfield": {
@@ -71,21 +68,21 @@ These fields are saved and loaded with each config profile:
       "height": 1080,
       "fps": 30,                // Frames per second
       "delay": 5,               // Seconds to wait before starting this stream
-      "duration": 0             // Seconds to record (0 = manual stop)
+      "duration": 20            // Seconds to record (0 = manual stop)
     },
     "Backglass": {
       "enabled": true,
       "monitor": "Monitor 2",
       "x": 1920, "y": 0,
       "width": 1280, "height": 720,
-      "fps": 30, "delay": 5, "duration": 0
+      "fps": 30, "delay": 5, "duration": 20
     },
     "FullDMD": {
       "enabled": true,
       "monitor": "Monitor 2",
       "x": 3200, "y": 900,
       "width": 1280, "height": 180,
-      "fps": 30, "delay": 5, "duration": 0
+      "fps": 30, "delay": 5, "duration": 20
     }
   }
 }
@@ -108,14 +105,12 @@ These fields are saved and loaded with each config profile:
 | `audio_duration` | int | `0` | Audio duration in seconds (0 = auto-match longest screen) |
 | `audio_match_screen` | string | `"Playfield"` | Screen whose delay/duration the audio mirrors (empty = manual) |
 | `window_title` | string | `""` | Window title to focus before recording starts |
-| `open_folder_after` | bool | `false` | Open output/media folder in Explorer after recording |
-| `log_to_file` | bool | `false` | Write session log to `PinballRecorder.log` |
-| `pinup_db_path` | string | `""` | Path to `PUPDatabase.db` (auto-detected on startup) |
 | `pinup_game_rom` | string | `""` | ROM name of the selected PinUP table |
 | `pinup_game_media_dir` | string | `""` | Emulator POPMedia root (auto-populated from DB) |
 | `pinup_also_save` | bool | `false` | Copy files to POPMedia and keep originals in output folder |
-| `recent_files` | array | `[]` | Last 8 opened config files (managed automatically) |
 | `screens` | object | — | Per-screen configuration (see below) |
+
+> `open_folder_after`, `log_to_file`, `pinup_db_path`, and `recent_files` are **global preferences** — they live in `global.json` only and are not saved per config profile. Edit them via **File → Preferences…**.
 
 ### Per-screen fields (inside `"screens"`)
 
@@ -129,7 +124,7 @@ These fields are saved and loaded with each config profile:
 | `height` | int | `1080` | Height of the capture region in pixels |
 | `fps` | int | `30` | Frames per second for this stream |
 | `delay` | int | `5` | Seconds to wait before starting this stream |
-| `duration` | int | `0` | Recording duration in seconds (0 = record until manually stopped) |
+| `duration` | int | `20` | Recording duration in seconds (0 = record until manually stopped) |
 
 ---
 

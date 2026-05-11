@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- Headless CLI now accepts all config values as command-line arguments (`--output-folder`, `--file-prefix`, `--rom`, `--screen-*`, `--audio-*`, etc.) so a config JSON file is no longer required for automation
+
+### Changed
+
+### Fixed
+- Title bar showed v1.1.0 instead of v2.0.0 — `APP_VERSION` constant in source was never updated before the v2.0.0 build
+- SQLite connection in `load_pinup_games` now uses a context manager so the connection closes correctly even if an error occurs mid-query
+- Clearing Recent Files in Preferences and then clicking Cancel no longer wipes the in-memory recent-files list; the clear is deferred until OK is confirmed
+
 ## [v2.0.0] - 2026-05-11
 
 ### Added

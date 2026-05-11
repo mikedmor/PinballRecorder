@@ -21,7 +21,7 @@ import zipfile
 from ctypes import windll, wintypes
 from datetime import datetime
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "2.0.0"
 
 # ─── Monitor Detection ─────────────────────────────────────────────────────────
 
@@ -231,19 +231,18 @@ def load_pinup_games(db_path):
     ``C:\\vPinball\\PinUPSystem\\POPMedia\\Visual Pinball X``.
     """
     try:
-        conn = sqlite3.connect(db_path)
-        cur  = conn.cursor()
-        cur.execute("""
-            SELECT g.GameDisplay, g.GameFileName,
-                   COALESCE(e.DirMedia, '')  AS DirMedia,
-                   COALESCE(e.EmuName,  '')  AS EmuName
-            FROM   Games g
-            LEFT JOIN Emulators e ON g.EMUID = e.EMUID
-            WHERE  g.GameFileName IS NOT NULL AND g.GameFileName != ''
-            ORDER  BY g.GameDisplay COLLATE NOCASE
-        """)
-        rows = cur.fetchall()
-        conn.close()
+        with sqlite3.connect(db_path) as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT g.GameDisplay, g.GameFileName,
+                       COALESCE(e.DirMedia, '')  AS DirMedia,
+                       COALESCE(e.EmuName,  '')  AS EmuName
+                FROM   Games g
+                LEFT JOIN Emulators e ON g.EMUID = e.EMUID
+                WHERE  g.GameFileName IS NOT NULL AND g.GameFileName != ''
+                ORDER  BY g.GameDisplay COLLATE NOCASE
+            """)
+            rows = cur.fetchall()
         result = []
         for display, filename, dir_media, emu_name in rows:
             rom = os.path.splitext(filename)[0]  # strip .vpx / .exe
@@ -617,9 +616,8 @@ class PinballRecorder(tk.Tk):
         g   = self._pinup_rom_map.get(rom)
         self.pinup_game_combo.set(g["display"] if g else "")
         self._update_pinup_preview()
-        # Re-apply after the deferred trace reload (300ms) to ensure selection sticks
+        # Re-apply after any deferred trace reload (300ms) to ensure selection sticks
         def _reapply_selection():
-            self._load_pinup_db()
             g2 = self._pinup_rom_map.get(rom)
             if g2:
                 self.pinup_game_combo.set(g2["display"])
@@ -815,14 +813,6 @@ class PinballRecorder(tk.Tk):
         self.pinup_game_var.trace_add("write", self._schedule_save)
         self.pinup_game_var.trace_add("write", lambda *_: self._update_pinup_preview())
 
-    def _fmt_db_name(self):
-        """Short display string for the currently configured PinUP DB path."""
-        db = self.pinup_db_var.get() if hasattr(self, "pinup_db_var") else self.prefs.get("pinup_db_path", "")
-        if not db:
-            return "(not configured — set in ⚙ Preferences)"
-        name = os.path.basename(db)
-        return name if os.path.exists(db) else f"{name}  ⚠ not found"
-
     def _update_ffmpeg_state(self):
         """Enable or disable the Start button based on whether FFmpeg is configured."""
         if not hasattr(self, "start_btn") or self.recording:
@@ -954,14 +944,15 @@ class PinballRecorder(tk.Tk):
         # ── Recent files ──────────────────────────────────────────────────────
         tk.Label(frm, text="Recent Files:", bg=BG, fg=FG).grid(
             row=r, column=0, sticky="w", pady=(10, 0))
-        n_recent = len(self.prefs.get("recent_files", []))
-        recent_cnt = tk.StringVar(value=f"{n_recent} saved file(s)")
+        local_recent = list(self.prefs.get("recent_files", []))
+        recent_cnt = tk.StringVar(value=f"{len(local_recent)} saved file(s)")
         tk.Label(frm, textvariable=recent_cnt,
                  bg=BG, fg="#585b70", font=("Segoe UI", 8)).grid(
             row=r, column=1, sticky="w", pady=(10, 0))
 
         def _clear_recent():
-            self.prefs["recent_files"] = []
+            nonlocal local_recent
+            local_recent = []
             recent_cnt.set("0 saved file(s)")
 
         self._btn(frm, "Clear", _clear_recent, fg=FG, padx=8).grid(
@@ -982,7 +973,7 @@ class PinballRecorder(tk.Tk):
             self.prefs["pinup_db_path"]     = db_var.get()
             self.prefs["open_folder_after"] = open_var.get()
             self.prefs["log_to_file"]       = log_var.get()
-            # recent_files already cleared in-place if Clear was clicked
+            self.prefs["recent_files"]      = local_recent
             save_prefs(self.prefs)
             # Sync in-memory tk vars so recording and log logic picks up changes
             self.pinup_db_var.set(db_var.get())
@@ -2551,32 +2542,121 @@ if __name__ == "__main__":
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  PinballRecorder.exe                        # Open GUI with saved settings\n"
-            "  PinballRecorder.exe --config my.json      # Open GUI pre-loaded with my.json\n"
-            "  PinballRecorder.exe --config my.json --autostart  # Headless: record and exit\n"
+            "  PinballRecorder.exe\n"
+            "      Open GUI with saved settings\n"
+            "  PinballRecorder.exe --config my.json\n"
+            "      Open GUI pre-loaded with my.json\n"
+            "  PinballRecorder.exe --config my.json --autostart\n"
+            "      Headless: record using my.json and exit when done\n"
+            "  PinballRecorder.exe --autostart --rom mygame --duration 30\n"
+            "      Headless: record all screens for 30s using saved config, tag as ROM 'mygame'\n"
+            "  PinballRecorder.exe --autostart --screen-playfield-enabled 0 --screen-fulldmd-enabled 0 --duration 20\n"
+            "      Headless: record Backglass only for 20s\n"
         ),
     )
-    parser.add_argument(
-        "--config", metavar="PATH",
-        help="Path to a JSON config file. Overrides the default saved config."
-    )
-    parser.add_argument(
-        "--autostart", action="store_true",
-        help="Automatically start recording on launch and exit when done. Requires --config with a duration set per screen."
-    )
+
+    # ── Config file ────────────────────────────────────────────────────────────
+    parser.add_argument("--config", metavar="PATH",
+                        help="Base JSON config file. CLI args override individual values.")
+    parser.add_argument("--autostart", action="store_true",
+                        help="Start recording immediately and exit when done.")
+
+    # ── Top-level config overrides ─────────────────────────────────────────────
+    parser.add_argument("--output-folder", metavar="PATH",
+                        help="Output folder for recordings.")
+    parser.add_argument("--file-prefix", metavar="STR",
+                        help="Filename prefix for recorded files.")
+    parser.add_argument("--rom", metavar="NAME",
+                        help="PinUP ROM/game name (selects the PinUP table and output folder).")
+    parser.add_argument("--window-title", metavar="STR",
+                        help="Window title for window-focus capture mode.")
+
+    # ── Global duration / delay shorthand (applies to all enabled screens + audio) ──
+    parser.add_argument("--delay", metavar="SECS", type=float,
+                        help="Recording start delay in seconds for all enabled screens.")
+    parser.add_argument("--duration", metavar="SECS", type=float,
+                        help="Recording duration in seconds for all enabled screens.")
+
+    # ── Audio overrides ────────────────────────────────────────────────────────
+    parser.add_argument("--audio-enabled", metavar="0|1", type=int, choices=[0, 1],
+                        help="Enable (1) or disable (0) audio recording.")
+    parser.add_argument("--audio-device", metavar="NAME",
+                        help="Audio capture device name or substring.")
+    parser.add_argument("--audio-delay", metavar="SECS", type=float,
+                        help="Audio recording start delay in seconds.")
+    parser.add_argument("--audio-duration", metavar="SECS", type=float,
+                        help="Audio recording duration in seconds.")
+
+    # ── Per-screen overrides: --screen-<name>-<field> ─────────────────────────
+    # Supported fields: enabled, x, y, width, height, fps, delay, duration
+    for _sname in ("playfield", "backglass", "fulldmd"):
+        g = parser.add_argument_group(f"{_sname} screen")
+        g.add_argument(f"--screen-{_sname}-enabled", metavar="0|1", type=int, choices=[0, 1],
+                       help=f"Enable (1) or disable (0) the {_sname} screen.")
+        g.add_argument(f"--screen-{_sname}-x",        metavar="PX",   type=int)
+        g.add_argument(f"--screen-{_sname}-y",        metavar="PX",   type=int)
+        g.add_argument(f"--screen-{_sname}-width",    metavar="PX",   type=int)
+        g.add_argument(f"--screen-{_sname}-height",   metavar="PX",   type=int)
+        g.add_argument(f"--screen-{_sname}-fps",      metavar="FPS",  type=int)
+        g.add_argument(f"--screen-{_sname}-delay",    metavar="SECS", type=float)
+        g.add_argument(f"--screen-{_sname}-duration", metavar="SECS", type=float)
+
     args = parser.parse_args()
 
+    # ── Build config: start from file (or saved default), then apply CLI args ──
     cli_cfg = None
     if args.config:
         try:
             with open(args.config) as f:
                 cli_cfg = json.load(f)
-            # Fill any missing keys from defaults
-            for k, v in DEFAULT_CONFIG.items():
-                cli_cfg.setdefault(k, v)
         except Exception as e:
             print(f"ERROR: Could not load config '{args.config}': {e}")
             sys.exit(1)
+    elif args.autostart:
+        # Headless without a config file: start from the saved/default config
+        cli_cfg = load_config()
+
+    if cli_cfg is not None:
+        cli_cfg = _deep_merge_config(cli_cfg)
+
+        # Apply top-level overrides
+        if args.output_folder:
+            cli_cfg["output_folder"] = args.output_folder
+        if args.file_prefix:
+            cli_cfg["file_prefix"] = args.file_prefix
+        if args.rom:
+            cli_cfg["pinup_game_rom"] = args.rom
+        if args.window_title:
+            cli_cfg["window_title"] = args.window_title
+
+        # Global delay/duration shorthand — applies to all enabled screens
+        if args.delay is not None:
+            for sname in SCREENS:
+                cli_cfg["screens"][sname]["delay"] = args.delay
+        if args.duration is not None:
+            for sname in SCREENS:
+                cli_cfg["screens"][sname]["duration"] = args.duration
+
+        # Audio overrides
+        if args.audio_enabled is not None:
+            cli_cfg["audio_enabled"] = bool(args.audio_enabled)
+        if args.audio_device:
+            cli_cfg["audio_device"] = args.audio_device
+        if args.audio_delay is not None:
+            cli_cfg["audio_delay"] = args.audio_delay
+        if args.audio_duration is not None:
+            cli_cfg["audio_duration"] = args.audio_duration
+
+        # Per-screen overrides
+        _screen_cli_map = {"playfield": "Playfield", "backglass": "Backglass", "fulldmd": "FullDMD"}
+        for _slug, _sname in _screen_cli_map.items():
+            for _field in ("enabled", "x", "y", "width", "height", "fps", "delay", "duration"):
+                _val = getattr(args, f"screen_{_slug}_{_field}", None)
+                if _val is not None:
+                    if _field == "enabled":
+                        cli_cfg["screens"][_sname][_field] = bool(_val)
+                    else:
+                        cli_cfg["screens"][_sname][_field] = _val
 
     app = PinballRecorder(cli_config=cli_cfg, headless=args.autostart)
     app.mainloop()

@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [v2.1.0] - 2026-05-11
 
 ### Added
 - Headless CLI now accepts all config values as command-line arguments (`--output-folder`, `--file-prefix`, `--rom`, `--screen-*`, `--audio-*`, etc.) so a config JSON file is no longer required for automation

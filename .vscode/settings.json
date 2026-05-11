@@ -23,6 +23,14 @@
         "/^\\$lines = Get-Content C:\\\\vPinball\\\\PinballRecorder\\\\build_release\\.bat ; \\$lines\\[0\\.\\.183\\] \\| Set-Content C:\\\\vPinball\\\\PinballRecorder\\\\build_release\\.bat -Encoding UTF8 ; \\(Get-Content C:\\\\vPinball\\\\PinballRecorder\\\\build_release\\.bat \\| Measure-Object -Line\\)\\.Lines$/": {
             "approve": true,
             "matchCommandLine": true
+        },
+        "/^& \"C:\\\\vPinball\\\\PinballRecorder\\\\\\.venv\\\\Scripts\\\\python\\.exe\" \"C:\\\\vPinball\\\\PinballRecorder\\\\_dbinspect\\.py\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^& \"C:\\\\vPinball\\\\PinballRecorder\\\\\\.venv\\\\Scripts\\\\python\\.exe\" -c \"import ast, sys; ast\\.parse\\(open\\('C:/vPinball/PinballRecorder/PinballRecorder\\.py'\\)\\.read\\(\\)\\); print\\('Syntax OK'\\)\"$/": {
+            "approve": true,
+            "matchCommandLine": true
         }
     }
 }

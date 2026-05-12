@@ -1,6 +1,6 @@
 # Changelog
 
-## [v2.2.0] - 2026-05-11
+## [Unreleased]
 
 ### Added
 - **Application Audio Capture mode**: audio can now be captured directly from one or more specific application windows using the Windows Application Loopback API (Windows 10 2004 / build 19041+). This bypasses the system master volume entirely, so recordings are always at full amplitude regardless of how low the cabinet speakers are set. Select "Application" under Capture Mode in the Audio section, then pick one or more windows from the list. Multiple selections are mixed into a single MP3 using FFmpeg's `amix` filter.

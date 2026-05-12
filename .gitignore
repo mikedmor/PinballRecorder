@@ -8,6 +8,7 @@ update_changelog.ps1
 add_unreleased.ps1
 strip_unreleased.ps1
 extract_release_notes.ps1
+stamp_version.ps1
 PinballRecorder-*.zip
 
 # AI assistant files (local only)

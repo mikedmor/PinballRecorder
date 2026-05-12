@@ -96,6 +96,705 @@ def focus_window(hwnd):
     windll.user32.SetForegroundWindow(hwnd)
 
 
+def enum_windows_with_pid():
+    """Return list of (hwnd, title, pid) for all visible top-level windows."""
+    GetWindowThreadProcessId = ctypes.windll.user32.GetWindowThreadProcessId
+    result = []
+    EnumWindowsProc = ctypes.WINFUNCTYPE(
+        ctypes.c_bool,
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_int),
+    )
+
+    def _callback(hwnd, _):
+        if windll.user32.IsWindowVisible(hwnd):
+            length = windll.user32.GetWindowTextLengthW(hwnd)
+            if length > 0:
+                buf = ctypes.create_unicode_buffer(length + 1)
+                windll.user32.GetWindowTextW(hwnd, buf, length + 1)
+                pid = ctypes.c_ulong(0)
+                GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                result.append((hwnd, buf.value, pid.value))
+        return True
+
+    windll.user32.EnumWindows(EnumWindowsProc(_callback), 0)
+    return result
+
+
+def _write_wav(path, channels, sample_rate, bits_per_sample, is_float, data):
+    """Write a WAV file supporting both PCM (int) and IEEE float formats."""
+    import struct
+    fmt_tag    = 3 if is_float else 1
+    block_align = (bits_per_sample // 8) * channels
+    byte_rate   = sample_rate * block_align
+    with open(path, "wb") as f:
+        f.write(b"RIFF")
+        f.write(struct.pack("<I", 36 + len(data)))
+        f.write(b"WAVE")
+        f.write(b"fmt ")
+        f.write(struct.pack("<IHHIIHH", 16, fmt_tag, channels,
+                            sample_rate, byte_rate, block_align, bits_per_sample))
+        f.write(b"data")
+        f.write(struct.pack("<I", len(data)))
+        f.write(data)
+
+
+# Chromium-based apps have WASAPI sessions but their audio service is sandboxed
+# by Windows Job Objects, making Application Loopback capture impossible.
+# Apps using DirectSound/WaveOut also have no loopback-accessible WASAPI session.
+_UNSUPPORTED_APP_AUDIO_EXES = {
+    "chrome.exe", "brave.exe", "msedge.exe", "firefox.exe",
+    "opera.exe", "vivaldi.exe", "chromium.exe", "iexplore.exe",
+    "discord.exe", "discordapp.exe",      # Electron (Chromium-based)
+    "wmplayer.exe",                        # DirectSound/WaveOut
+    "explorer.exe",                        # Windows shell / File Explorer (system sounds only)
+    "steam.exe",                           # Steam overlay audio not loopback-accessible
+    "razerappengine.exe", "razercentralservice.exe",  # Razer background services
+}
+
+
+def _build_pid_info_map():
+    """Return {pid: (parent_pid, exe_name_lower)} for all running processes."""
+    import ctypes as _ct, ctypes.wintypes as _wt
+    TH32CS_SNAPPROCESS = 0x00000002
+    class PROCESSENTRY32W(_ct.Structure):
+        _fields_ = [("dwSize", _wt.DWORD), ("cntUsage", _wt.DWORD),
+                    ("th32ProcessID", _wt.DWORD), ("th32DefaultHeapID", _ct.c_size_t),
+                    ("th32ModuleID", _wt.DWORD), ("cntThreads", _wt.DWORD),
+                    ("th32ParentProcessID", _wt.DWORD), ("pcPriClassBase", _wt.LONG),
+                    ("dwFlags", _wt.DWORD), ("szExeFile", _wt.WCHAR * 260)]
+    kernel32 = _ct.WinDLL("kernel32", use_last_error=True)
+    snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    result = {}
+    if snap == _wt.HANDLE(-1).value:
+        return result
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = _ct.sizeof(PROCESSENTRY32W)
+        if kernel32.Process32FirstW(snap, _ct.byref(entry)):
+            while True:
+                result[entry.th32ProcessID] = (entry.th32ParentProcessID,
+                                               entry.szExeFile.lower())
+                if not kernel32.Process32NextW(snap, _ct.byref(entry)):
+                    break
+    finally:
+        kernel32.CloseHandle(snap)
+    return result
+
+
+def _get_wasapi_active_pids():
+    """Return the set of PIDs that currently have an active WASAPI render session.
+
+    Only apps using WASAPI (or XAudio2/DirectX which route through WASAPI) will
+    appear.  Apps using DirectSound/WaveOut or whose audio service is sandboxed
+    (Chromium browsers) will not.  Returns an empty set on any COM error.
+    """
+    import ctypes as _ct, ctypes.wintypes as _wt, uuid as _uuid
+
+    class _GUID(_ct.Structure):
+        _fields_ = [("Data1", _wt.DWORD), ("Data2", _wt.WORD),
+                    ("Data3", _wt.WORD),  ("Data4", _ct.c_ubyte * 8)]
+
+    def _guid(s):
+        b = _uuid.UUID(s).bytes_le
+        return _GUID(int.from_bytes(b[0:4], "little"),
+                     int.from_bytes(b[4:6], "little"),
+                     int.from_bytes(b[6:8], "little"),
+                     (_ct.c_ubyte * 8)(*b[8:]))
+
+    def _vt(obj):
+        return _ct.cast(_ct.cast(obj, _ct.POINTER(_ct.c_void_p))[0],
+                        _ct.POINTER(_ct.c_void_p))
+
+    def _fn(vt, idx, res, *args):
+        return _ct.WINFUNCTYPE(res, _ct.c_void_p, *args)(vt[idx])
+
+    VP, HR, DW, UL = _ct.c_void_p, _ct.HRESULT, _wt.DWORD, _wt.ULONG
+
+    CLSID_MMDeviceEnumerator  = _guid("{BCDE0395-E52F-467C-8E3D-C4579291692E}")
+    IID_IMMDeviceEnumerator   = _guid("{A95664D2-9614-4F35-A746-DE8DB63617E6}")
+    IID_IAudioSessionManager2 = _guid("{77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F}")
+    IID_IAudioSessionControl2 = _guid("{BFB7FF88-7239-4FC9-8FA2-07C950BE9C6D}")
+
+    ole32 = _ct.WinDLL("ole32")
+    # CoInitialize(STA) is compatible with tkinter's COM state on the main thread.
+    # If COM is already initialised (S_FALSE = 1), we still use it; we only
+    # call CoUninitialize if *we* were the ones who advanced the refcount.
+    hr = ole32.CoInitialize(None)
+    _we_init = (hr == 0)  # S_OK; S_FALSE means already init'd, don't balance
+    if hr < 0:
+        return set()
+
+    pids = set()
+    objs = []  # track COM pointers for Release in reverse order
+    try:
+        def _rel(p):
+            if p:
+                _fn(_vt(p), 2, UL)(p)
+
+        # IMMDeviceEnumerator
+        pEnum = VP()
+        if ole32.CoCreateInstance(_ct.byref(CLSID_MMDeviceEnumerator), None, 1,
+                                  _ct.byref(IID_IMMDeviceEnumerator),
+                                  _ct.byref(pEnum)) < 0 or not pEnum:
+            return pids
+        objs.append(pEnum)
+
+        # IMMDevice (default render endpoint)
+        pDev = VP()
+        if _fn(_vt(pEnum), 4, HR, _ct.c_int, _ct.c_int,
+               _ct.POINTER(VP))(pEnum, 0, 0, _ct.byref(pDev)) < 0 or not pDev:
+            return pids
+        objs.append(pDev)
+
+        # IAudioSessionManager2
+        pMgr = VP()
+        if _fn(_vt(pDev), 3, HR, _ct.POINTER(_GUID), DW, VP,
+               _ct.POINTER(VP))(pDev, _ct.byref(IID_IAudioSessionManager2),
+                                 1, None, _ct.byref(pMgr)) < 0 or not pMgr:
+            return pids
+        objs.append(pMgr)
+
+        # IAudioSessionEnumerator
+        pSE = VP()
+        if _fn(_vt(pMgr), 5, HR, _ct.POINTER(VP))(pMgr, _ct.byref(pSE)) < 0 or not pSE:
+            return pids
+        objs.append(pSE)
+
+        count = _ct.c_int(0)
+        if _fn(_vt(pSE), 3, HR, _ct.POINTER(_ct.c_int))(pSE, _ct.byref(count)) < 0:
+            return pids
+
+        for i in range(count.value):
+            pCtrl = VP()
+            if _fn(_vt(pSE), 4, HR, _ct.c_int,
+                   _ct.POINTER(VP))(pSE, i, _ct.byref(pCtrl)) < 0 or not pCtrl:
+                continue
+            # QI for IAudioSessionControl2 (has GetProcessId at vtable slot 14)
+            pCtrl2 = VP()
+            hr2 = _fn(_vt(pCtrl), 0, HR, _ct.POINTER(_GUID),
+                      _ct.POINTER(VP))(pCtrl, _ct.byref(IID_IAudioSessionControl2),
+                                       _ct.byref(pCtrl2))
+            _rel(pCtrl)
+            if hr2 < 0 or not pCtrl2:
+                continue
+            pid_val = DW(0)
+            if _fn(_vt(pCtrl2), 14, HR, _ct.POINTER(DW))(pCtrl2,
+                                                           _ct.byref(pid_val)) >= 0:
+                if pid_val.value:
+                    pids.add(pid_val.value)
+            _rel(pCtrl2)
+
+    except Exception:
+        pass
+    finally:
+        for p in reversed(objs):
+            _rel(p)
+        if _we_init:
+            ole32.CoUninitialize()
+
+    return pids
+
+
+def _find_root_audio_pid(pid):
+    """Walk the process tree upward, staying within the same exe name, to find
+    the root ancestor process.  Chrome/Brave/Edge route audio through child
+    processes; capturing the root covers the whole tree via INCLUDE_PROCESS_TREE.
+    Returns the resolved PID (falls back to the original pid on any error).
+    """
+    import ctypes as _ct
+    import ctypes.wintypes as _wt
+
+    TH32CS_SNAPPROCESS = 0x00000002
+
+    class PROCESSENTRY32W(_ct.Structure):
+        _fields_ = [
+            ("dwSize",              _wt.DWORD),
+            ("cntUsage",            _wt.DWORD),
+            ("th32ProcessID",       _wt.DWORD),
+            ("th32DefaultHeapID",   _ct.c_size_t),
+            ("th32ModuleID",        _wt.DWORD),
+            ("cntThreads",          _wt.DWORD),
+            ("th32ParentProcessID", _wt.DWORD),
+            ("pcPriClassBase",      _wt.LONG),
+            ("dwFlags",             _wt.DWORD),
+            ("szExeFile",           _wt.WCHAR * 260),
+        ]
+
+    kernel32 = _ct.WinDLL("kernel32", use_last_error=True)
+    snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if snap == _wt.HANDLE(-1).value:
+        return pid
+
+    try:
+        proc_map  = {}   # pid → (parent_pid, exe_name)
+        entry     = PROCESSENTRY32W()
+        entry.dwSize = _ct.sizeof(PROCESSENTRY32W)
+        if kernel32.Process32FirstW(snap, _ct.byref(entry)):
+            while True:
+                proc_map[entry.th32ProcessID] = (
+                    entry.th32ParentProcessID,
+                    entry.szExeFile.lower(),
+                )
+                if not kernel32.Process32NextW(snap, _ct.byref(entry)):
+                    break
+    finally:
+        kernel32.CloseHandle(snap)
+
+    # Walk up the tree as long as the *parent* has the same exe name.
+    # proc_map[pid] = (parent_pid, exe_of_pid), so to check the parent's exe
+    # we must look up proc_map[parent_pid][1] separately.
+    current = pid
+    exe = proc_map.get(current, (0, ""))[1]
+    while True:
+        parent, _ = proc_map.get(current, (0, ""))
+        if parent == 0:
+            break
+        parent_exe = proc_map.get(parent, (0, ""))[1]
+        if parent_exe != exe:
+            break
+        current = parent
+    return current
+
+
+def _get_child_pids(parent_pid):
+    """Return direct child PIDs of parent_pid, same-exe-name children first."""
+    import ctypes as _ct
+    import ctypes.wintypes as _wt
+
+    TH32CS_SNAPPROCESS = 0x00000002
+
+    class PROCESSENTRY32W(_ct.Structure):
+        _fields_ = [
+            ("dwSize",              _wt.DWORD),
+            ("cntUsage",            _wt.DWORD),
+            ("th32ProcessID",       _wt.DWORD),
+            ("th32DefaultHeapID",   _ct.c_size_t),
+            ("th32ModuleID",        _wt.DWORD),
+            ("cntThreads",          _wt.DWORD),
+            ("th32ParentProcessID", _wt.DWORD),
+            ("pcPriClassBase",      _wt.LONG),
+            ("dwFlags",             _wt.DWORD),
+            ("szExeFile",           _wt.WCHAR * 260),
+        ]
+
+    kernel32 = _ct.WinDLL("kernel32", use_last_error=True)
+    snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if snap == _wt.HANDLE(-1).value:
+        return []
+
+    try:
+        parent_exe = ""
+        same_exe, other = [], []
+        entry = PROCESSENTRY32W()
+        entry.dwSize = _ct.sizeof(PROCESSENTRY32W)
+        if kernel32.Process32FirstW(snap, _ct.byref(entry)):
+            while True:
+                if entry.th32ProcessID == parent_pid:
+                    parent_exe = entry.szExeFile.lower()
+                if not kernel32.Process32NextW(snap, _ct.byref(entry)):
+                    break
+        # Second pass: collect children
+        entry.dwSize = _ct.sizeof(PROCESSENTRY32W)
+        if kernel32.Process32FirstW(snap, _ct.byref(entry)):
+            while True:
+                if entry.th32ParentProcessID == parent_pid:
+                    if entry.szExeFile.lower() == parent_exe:
+                        same_exe.append(entry.th32ProcessID)
+                    else:
+                        other.append(entry.th32ProcessID)
+                if not kernel32.Process32NextW(snap, _ct.byref(entry)):
+                    break
+        return same_exe + other
+    finally:
+        kernel32.CloseHandle(snap)
+
+
+def _app_loopback_capture(pid, wav_path, stop_evt, duration, on_log=None):
+    """Capture audio from a specific process PID using the Windows Application
+    Loopback API (requires Windows 10 build 19041+).
+    Blocks until stop_evt is set or duration expires, then writes WAV to wav_path.
+    """
+    import sys as _sys, ctypes as _ct, ctypes.wintypes as _wt, threading as _thr
+    import time as _time
+
+    build = _sys.getwindowsversion().build
+    if build < 19041:
+        raise RuntimeError(
+            f"Application Loopback requires Windows 10 2004+ (build 19041). "
+            f"Current build: {build}"
+        )
+
+    # ── GUID bytes helper ─────────────────────────────────────────────────────
+    def _guid(s):
+        s = s.strip("{}")
+        p = s.split("-")
+        d1 = int(p[0], 16).to_bytes(4, "little")
+        d2 = int(p[1], 16).to_bytes(2, "little")
+        d3 = int(p[2], 16).to_bytes(2, "little")
+        d4 = bytes.fromhex(p[3] + p[4])
+        return (_ct.c_byte * 16)(*d1, *d2, *d3, *d4)
+
+    IID_IAudioClient        = _guid("{1CB9AD4C-DBFA-4C32-B178-C2F568A703B2}")
+    IID_IAudioCaptureClient = _guid("{C8ADBD64-E71E-48A0-A4DE-185C395CD317}")
+    IID_ICompletionHandler  = _guid("{41D949AB-9862-444A-80F6-C261334DA5EB}")
+    IID_IUnknown            = _guid("{00000000-0000-0000-C000-000000000046}")
+    IID_IAgileObject        = _guid("{94EA2B94-E9CC-49E0-C0FF-EE64CA8F5B90}")
+    KSDATAFORMAT_SUBTYPE_FLOAT = bytes(_guid("{00000003-0000-0010-8000-00AA00389B71}"))
+    VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK = "VAD\\{2eef81be-33fa-4800-9670-1cd474972c3f}"
+
+    _IID_COMPLETION_BYTES = bytes(IID_ICompletionHandler)
+    _IID_UNKNOWN_BYTES    = bytes(IID_IUnknown)
+    _IID_AGILE_BYTES      = bytes(IID_IAgileObject)
+
+    # ── Structures ────────────────────────────────────────────────────────────
+    class WAVEFORMATEX(_ct.Structure):
+        _fields_ = [("wFormatTag",      _wt.WORD),
+                    ("nChannels",       _wt.WORD),
+                    ("nSamplesPerSec",  _wt.DWORD),
+                    ("nAvgBytesPerSec", _wt.DWORD),
+                    ("nBlockAlign",     _wt.WORD),
+                    ("wBitsPerSample",  _wt.WORD),
+                    ("cbSize",          _wt.WORD)]
+
+    class _WFEXT_SAMPLES(_ct.Union):
+        _fields_ = [("wValidBitsPerSample", _wt.WORD),
+                    ("wSamplesPerBlock",     _wt.WORD),
+                    ("wReserved",            _wt.WORD)]
+
+    class WAVEFORMATEXTENSIBLE(_ct.Structure):
+        _fields_ = [("Format",        WAVEFORMATEX),
+                    ("Samples",       _WFEXT_SAMPLES),
+                    ("dwChannelMask", _wt.DWORD),
+                    ("SubFormat",     _ct.c_byte * 16)]
+
+    class AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS(_ct.Structure):
+        _fields_ = [("TargetProcessId",    _wt.DWORD),
+                    ("ProcessLoopbackMode", _ct.c_int)]
+
+    class AUDIOCLIENT_ACTIVATION_PARAMS(_ct.Structure):
+        _fields_ = [("ActivationType",       _ct.c_int),
+                    ("ProcessLoopbackParams", AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS)]
+
+    class _BlobData(_ct.Structure):
+        _fields_ = [("cbSize",    _wt.DWORD),
+                    ("pBlobData", _ct.c_void_p)]
+
+    class _PV_Union(_ct.Union):
+        _fields_ = [("blob", _BlobData), ("_pad", _ct.c_byte * 16)]
+
+    class PROPVARIANT(_ct.Structure):
+        _fields_ = [("vt", _wt.WORD),
+                    ("r1", _wt.WORD), ("r2", _wt.WORD), ("r3", _wt.WORD),
+                    ("u",  _PV_Union)]
+
+    WAVE_FORMAT_EXTENSIBLE     = 0xFFFE
+    AUDCLNT_SHAREMODE_SHARED   = 0
+    AUDCLNT_STREAMFLAGS_LOOPBACK = 0x00020000
+    AUDCLNT_BUFFERFLAGS_SILENT   = 0x2
+    VT_BLOB = 0x41
+
+    # ── IActivateAudioInterfaceCompletionHandler COM vtable ───────────────────
+    HR       = _ct.c_long
+    QI_FT    = _ct.WINFUNCTYPE(HR, _ct.c_void_p, _ct.c_void_p,
+                                _ct.POINTER(_ct.c_void_p))
+    ADDREF_FT  = _ct.WINFUNCTYPE(_ct.c_ulong, _ct.c_void_p)
+    RELEASE_FT = _ct.WINFUNCTYPE(_ct.c_ulong, _ct.c_void_p)
+    DONE_FT    = _ct.WINFUNCTYPE(HR, _ct.c_void_p, _ct.c_void_p)
+
+    completed_event = _thr.Event()
+    async_op_box    = [None]
+
+    def _qi(this, riid, ppv):
+        if riid:
+            try:
+                queried = bytes((_ct.c_byte * 16).from_address(riid))
+                # Accept IUnknown, IActivateAudioInterfaceCompletionHandler, and
+                # IAgileObject so COM treats the handler as free-threaded and does
+                # not attempt cross-apartment marshaling.
+                if queried in (_IID_COMPLETION_BYTES, _IID_UNKNOWN_BYTES,
+                               _IID_AGILE_BYTES):
+                    if ppv:
+                        _ct.cast(ppv, _ct.POINTER(_ct.c_void_p))[0] = this
+                    return 0   # S_OK
+            except Exception:
+                pass
+        return 0x80004002   # E_NOINTERFACE
+
+    def _addref(this):   return 1
+    def _release(this):  return 1
+    def _completed(this, op):
+        async_op_box[0] = op
+        completed_event.set()
+        return 0
+
+    _qi_cb   = QI_FT(_qi)
+    _ar_cb   = ADDREF_FT(_addref)
+    _rel_cb  = RELEASE_FT(_release)
+    _done_cb = DONE_FT(_completed)
+
+    class _VTable(_ct.Structure):
+        _fields_ = [("qi",        QI_FT),
+                    ("addref",    ADDREF_FT),
+                    ("release",   RELEASE_FT),
+                    ("completed", DONE_FT)]
+
+    vtable  = _VTable(_qi_cb, _ar_cb, _rel_cb, _done_cb)
+
+    class _Handler(_ct.Structure):
+        _fields_ = [("lpVtbl", _ct.POINTER(_VTable))]
+
+    handler     = _Handler(_ct.pointer(vtable))
+    handler_ptr = _ct.addressof(handler)
+
+    # ── Activation params ─────────────────────────────────────────────────────
+    act_params = AUDIOCLIENT_ACTIVATION_PARAMS()
+    act_params.ActivationType = 1   # AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK
+    act_params.ProcessLoopbackParams.TargetProcessId    = pid
+    act_params.ProcessLoopbackParams.ProcessLoopbackMode = 0  # INCLUDE_TARGET_PROCESS_TREE
+
+    pv            = PROPVARIANT()
+    pv.vt         = VT_BLOB
+    pv.u.blob.cbSize   = _ct.sizeof(act_params)
+    pv.u.blob.pBlobData = _ct.addressof(act_params)
+
+    ole32    = _ct.WinDLL("ole32")
+    mmdevapi = _ct.WinDLL("mmdevapi")
+
+    # ActivateAudioInterfaceAsync requires MTA (returns RO_E_WRONG_STATE from STA).
+    hr_init = ole32.CoInitializeEx(None, 0x0)   # COINIT_MULTITHREADED
+    if on_log:
+        on_log(f"  CoInitializeEx(MTA): 0x{hr_init & 0xFFFFFFFF:08X}")
+    if hr_init not in (0, 1):
+        raise RuntimeError(f"CoInitializeEx failed: 0x{hr_init & 0xFFFFFFFF:08X}")
+    try:
+        fn = mmdevapi.ActivateAudioInterfaceAsync
+        fn.restype  = HR
+        fn.argtypes = [_ct.c_wchar_p, _ct.c_void_p, _ct.c_void_p,
+                       _ct.c_void_p, _ct.POINTER(_ct.c_void_p)]
+
+        async_op_out = _ct.c_void_p()
+        hr = fn(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
+                _ct.addressof(IID_IAudioClient),
+                _ct.addressof(pv),
+                handler_ptr,
+                _ct.byref(async_op_out))
+        if hr < 0:
+            raise RuntimeError(f"ActivateAudioInterfaceAsync: 0x{hr & 0xFFFFFFFF:08X}")
+
+        # MTA: callback arrives on an RPC worker thread, no message pump needed.
+        if not completed_event.wait(timeout=10):
+            raise RuntimeError("Audio activation timed out (10s)")
+
+        async_op = async_op_box[0]
+        if not async_op:
+            raise RuntimeError("No async_op pointer after activation")
+
+        # ── GetActivateResult (IActivateAudioInterfaceAsyncOperation vtable[3]) ──
+        GAR_FT = _ct.WINFUNCTYPE(HR, _ct.c_void_p,
+                                   _ct.POINTER(_ct.c_long),
+                                   _ct.POINTER(_ct.c_void_p))
+        op_vp   = _ct.cast(_ct.c_void_p(async_op), _ct.POINTER(_ct.c_void_p))
+        op_vtbl = _ct.cast(_ct.c_void_p(op_vp[0]),  _ct.POINTER(_ct.c_void_p))
+        GetActivateResult = GAR_FT(op_vtbl[3])
+
+        act_hr = _ct.c_long()
+        ac_ptr = _ct.c_void_p()
+        hr = GetActivateResult(async_op, _ct.byref(act_hr), _ct.byref(ac_ptr))
+        if hr < 0 or act_hr.value < 0:
+            raise RuntimeError(
+                f"GetActivateResult: hr=0x{hr&0xFFFFFFFF:08X} "
+                f"activate=0x{act_hr.value&0xFFFFFFFF:08X}"
+            )
+
+        audio_client = ac_ptr.value
+        ac_vp   = _ct.cast(_ct.c_void_p(audio_client), _ct.POINTER(_ct.c_void_p))
+        ac_vtbl = _ct.cast(_ct.c_void_p(ac_vp[0]),     _ct.POINTER(_ct.c_void_p))
+
+        # ── GetMixFormat (IAudioClient vtable[8]) ─────────────────────────────
+        GMF_FT = _ct.WINFUNCTYPE(HR, _ct.c_void_p, _ct.POINTER(_ct.c_void_p))
+        GetMixFormat = GMF_FT(ac_vtbl[8])
+
+        fmt_ptr = _ct.c_void_p()
+        hr = GetMixFormat(audio_client, _ct.byref(fmt_ptr))
+        if hr < 0:
+            raise RuntimeError(f"GetMixFormat: 0x{hr&0xFFFFFFFF:08X}")
+
+        base_fmt        = _ct.cast(fmt_ptr, _ct.POINTER(WAVEFORMATEX)).contents
+        channels        = base_fmt.nChannels
+        sample_rate     = base_fmt.nSamplesPerSec
+        bits_per_sample = base_fmt.wBitsPerSample
+        is_float        = base_fmt.wFormatTag == 3   # WAVE_FORMAT_IEEE_FLOAT
+
+        if base_fmt.wFormatTag == WAVE_FORMAT_EXTENSIBLE:
+            ext      = _ct.cast(fmt_ptr, _ct.POINTER(WAVEFORMATEXTENSIBLE)).contents
+            is_float = (bytes(ext.SubFormat) == KSDATAFORMAT_SUBTYPE_FLOAT)
+
+        # ── Initialize (vtable[3]) ────────────────────────────────────────────
+        INIT_FT = _ct.WINFUNCTYPE(HR, _ct.c_void_p, _ct.c_int, _wt.DWORD,
+                                   _ct.c_longlong, _ct.c_longlong,
+                                   _ct.c_void_p, _ct.c_void_p)
+        Initialize = INIT_FT(ac_vtbl[3])
+        hr = Initialize(audio_client, AUDCLNT_SHAREMODE_SHARED,
+                        AUDCLNT_STREAMFLAGS_LOOPBACK,
+                        2_000_000, 0, fmt_ptr, None)
+        ole32.CoTaskMemFree(fmt_ptr)
+        if hr < 0:
+            raise RuntimeError(f"IAudioClient::Initialize: 0x{hr&0xFFFFFFFF:08X}")
+
+        # ── GetService → IAudioCaptureClient (vtable[14]) ────────────────────
+        GS_FT = _ct.WINFUNCTYPE(HR, _ct.c_void_p, _ct.c_void_p,
+                                  _ct.POINTER(_ct.c_void_p))
+        GetService = GS_FT(ac_vtbl[14])
+
+        cc_ptr = _ct.c_void_p()
+        hr = GetService(audio_client,
+                        _ct.addressof(IID_IAudioCaptureClient),
+                        _ct.byref(cc_ptr))
+        if hr < 0:
+            raise RuntimeError(f"GetService(CaptureClient): 0x{hr&0xFFFFFFFF:08X}")
+
+        capture_client = cc_ptr.value
+        cc_vp   = _ct.cast(_ct.c_void_p(capture_client), _ct.POINTER(_ct.c_void_p))
+        cc_vtbl = _ct.cast(_ct.c_void_p(cc_vp[0]),       _ct.POINTER(_ct.c_void_p))
+
+        GB_FT  = _ct.WINFUNCTYPE(HR, _ct.c_void_p,
+                                   _ct.POINTER(_ct.c_void_p),
+                                   _ct.POINTER(_wt.UINT), _ct.POINTER(_wt.DWORD),
+                                   _ct.POINTER(_ct.c_uint64),
+                                   _ct.POINTER(_ct.c_uint64))
+        RB_FT  = _ct.WINFUNCTYPE(HR, _ct.c_void_p, _wt.UINT)
+        GNP_FT = _ct.WINFUNCTYPE(HR, _ct.c_void_p, _ct.POINTER(_wt.UINT))
+        GetBuffer         = GB_FT(cc_vtbl[3])
+        ReleaseBuffer     = RB_FT(cc_vtbl[4])
+        GetNextPacketSize = GNP_FT(cc_vtbl[5])
+
+        # ── Start (vtable[10]) ────────────────────────────────────────────────
+        START_FT = _ct.WINFUNCTYPE(HR, _ct.c_void_p)
+        STOP_FT  = _ct.WINFUNCTYPE(HR, _ct.c_void_p)
+        Start = START_FT(ac_vtbl[10])
+        Stop  = STOP_FT(ac_vtbl[11])
+
+        hr = Start(audio_client)
+        if hr < 0:
+            raise RuntimeError(f"IAudioClient::Start: 0x{hr&0xFFFFFFFF:08X}")
+
+        if on_log:
+            on_log(f"  app loopback: PID {pid}, {channels}ch, "
+                   f"{sample_rate}Hz, {'float' if is_float else 'int'}{bits_per_sample}")
+
+        # ── Capture loop ──────────────────────────────────────────────────────
+        frames          = []
+        bytes_per_frame = (bits_per_sample // 8) * channels
+        t0              = _time.time()
+
+        while not stop_evt.is_set():
+            if duration > 0 and (_time.time() - t0) >= duration:
+                break
+
+            pkt_size = _wt.UINT(0)
+            GetNextPacketSize(capture_client, _ct.byref(pkt_size))
+
+            while pkt_size.value > 0:
+                data_vp = _ct.c_void_p()
+                nframes = _wt.UINT(0)
+                flags   = _wt.DWORD(0)
+                dev_pos = _ct.c_uint64(0)
+                qpc_pos = _ct.c_uint64(0)
+
+                hr = GetBuffer(capture_client,
+                               _ct.byref(data_vp), _ct.byref(nframes),
+                               _ct.byref(flags),   _ct.byref(dev_pos),
+                               _ct.byref(qpc_pos))
+                if hr >= 0 and nframes.value > 0:
+                    nbytes = nframes.value * bytes_per_frame
+                    if flags.value & AUDCLNT_BUFFERFLAGS_SILENT:
+                        frames.append(bytes(nbytes))
+                    else:
+                        frames.append(_ct.string_at(data_vp, nbytes))
+                    ReleaseBuffer(capture_client, nframes)
+                else:
+                    break
+                GetNextPacketSize(capture_client, _ct.byref(pkt_size))
+
+            _time.sleep(0.01)
+
+        Stop(audio_client)
+
+        if frames:
+            _write_wav(wav_path, channels, sample_rate, bits_per_sample,
+                       is_float, b"".join(frames))
+            if on_log:
+                on_log(f"  WAV captured: {sum(len(f) for f in frames):,} bytes "
+                       f"({len(frames)} chunk(s))")
+        else:
+            if on_log:
+                on_log(f"  ⚠ No audio frames captured from PID {pid}")
+
+    finally:
+        ole32.CoUninitialize()
+
+
+def _app_loopback_subprocess(pid, wav_path, stop_evt, duration, on_log=None):
+    """Run _app_loopback_capture in a fresh subprocess to isolate COM state.
+
+    The main process may have COM initialized by tkinter (STA) on the GUI thread.
+    Even though capture runs on a daemon thread, spawning a fresh Python process
+    guarantees a completely clean COM environment for the capture thread.
+    """
+    stop_file = wav_path + ".capstop"
+    if getattr(sys, "frozen", False):
+        cmd = [sys.executable, "--capture-audio",
+               str(pid), wav_path, str(duration), stop_file]
+    else:
+        cmd = [sys.executable, os.path.abspath(__file__),
+               "--capture-audio", str(pid), wav_path, str(duration), stop_file]
+
+    if on_log:
+        on_log(f"  capture subprocess: PID {pid}")
+
+    _env = os.environ.copy()
+    _env["PYTHONIOENCODING"] = "utf-8"   # ensure print() can write any Unicode
+    _env["PYTHONUTF8"] = "1"             # Python 3.7+ UTF-8 mode
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+        env=_env,
+    )
+
+    def _relay():
+        for raw in proc.stdout:
+            line = raw.decode("utf-8", errors="replace").rstrip()
+            if line and on_log:
+                on_log(line)
+    t_relay = threading.Thread(target=_relay, daemon=True)
+    t_relay.start()
+
+    stop_evt.wait()
+
+    try:
+        open(stop_file, "w").close()
+    except OSError:
+        pass
+
+    try:
+        proc.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        if on_log:
+            on_log("  ⚠ Audio capture subprocess timed out")
+
+    try:
+        os.unlink(stop_file)
+    except OSError:
+        pass
+
+    t_relay.join(timeout=5)
+
+
 # ─── FFmpeg Helpers ────────────────────────────────────────────────────────────
 
 FFMPEG_SEARCH_PATHS = [
@@ -112,41 +811,43 @@ FFMPEG_SEARCH_PATHS = [
 
 def find_ffmpeg():
     import glob
-    # First: check the app's own directory (portable use — ffmpeg.exe next to the exe)
-    local = os.path.join(_APP_DIR, "ffmpeg.exe")
-    if os.path.exists(local):
+    _NO_WIN = subprocess.CREATE_NO_WINDOW
+
+    def _verify(path):
         try:
-            r = subprocess.run([local, "-version"], capture_output=True, timeout=3)
-            if r.returncode == 0:
-                return local
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
+            r = subprocess.run([path, "-version"], capture_output=True,
+                               timeout=5, creationflags=_NO_WIN)
+            return r.returncode == 0
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return False
+
+    # Check the app directory and the dist/ subdirectory (present when running from source)
+    for _candidate in (
+        os.path.join(_APP_DIR, "ffmpeg.exe"),
+        os.path.join(_APP_DIR, "dist", "ffmpeg.exe"),
+    ):
+        if os.path.exists(_candidate) and _verify(_candidate):
+            return _candidate
+
     # Then try shutil.which (searches system PATH)
     which = shutil.which("ffmpeg")
-    if which:
+    if which and _verify(which):
         return which
+
     # Glob-search winget Packages folder (version-agnostic)
     winget_pkgs = os.path.join(
         os.environ.get("LOCALAPPDATA", ""), "Microsoft", "WinGet", "Packages")
     for candidate in glob.glob(
             os.path.join(winget_pkgs, "Gyan.FFmpeg*", "**", "ffmpeg.exe"),
             recursive=True):
-        try:
-            r = subprocess.run([candidate, "-version"], capture_output=True, timeout=3)
-            if r.returncode == 0:
-                return candidate
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
+        if _verify(candidate):
+            return candidate
+
     # Then try known fixed locations
     for path in FFMPEG_SEARCH_PATHS:
-        if not path:
-            continue
-        try:
-            r = subprocess.run([path, "-version"], capture_output=True, timeout=3)
-            if r.returncode == 0:
-                return path
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            continue
+        if path and _verify(path):
+            return path
+
     return None
 
 
@@ -271,11 +972,12 @@ CONFIG_FILE  = os.path.join(CONFIGS_DIR, "default_config.json")
 GLOBAL_FILE  = os.path.join(_APP_DIR, "global.json")
 
 DEFAULT_PREFS = {
-    "ffmpeg_path":       "",
-    "pinup_db_path":     "",
-    "log_to_file":       False,
-    "recent_files":      [],
-    "open_folder_after": False,
+    "ffmpeg_path":        "",
+    "pinup_db_path":      "",
+    "log_to_file":        False,
+    "recent_files":       [],
+    "open_folder_after":  False,
+    "ignored_audio_apps": sorted(_UNSUPPORTED_APP_AUDIO_EXES),
 }
 
 
@@ -303,7 +1005,9 @@ DEFAULT_CONFIG = {
     "file_prefix":          "pinball",
     "ffmpeg_path":          "",
     "audio_enabled":        True,
+    "audio_capture_mode":   "device",
     "audio_device":         "",
+    "audio_app_windows":    [],
     "audio_delay":          0,
     "audio_duration":       0,
     "audio_match_screen":   "Playfield",
@@ -311,10 +1015,11 @@ DEFAULT_CONFIG = {
     "pinup_game_media_dir": "",
     "pinup_game_rom":       "",
     "pinup_also_save":      False,
+    "coords_v2":            True,
     "screens": {
-        "Playfield": {"enabled": True, "x": 0,    "y": 0, "width": 1920, "height": 1080, "fps": 30, "delay": 5, "duration": 20},
-        "Backglass": {"enabled": True, "x": 1920,  "y": 0, "width": 1280, "height": 720,  "fps": 30, "delay": 5, "duration": 20},
-        "FullDMD":   {"enabled": True, "x": 3200, "y": 900, "width": 1280, "height": 180, "fps": 30, "delay": 5, "duration": 20},
+        "Playfield": {"enabled": True, "x": 0, "y": 0, "width": 1920, "height": 1080, "fps": 30, "delay": 5, "duration": 20},
+        "Backglass": {"enabled": True, "x": 0, "y": 0, "width": 1280, "height": 720,  "fps": 30, "delay": 5, "duration": 20},
+        "FullDMD":   {"enabled": True, "x": 0, "y": 0, "width": 1280, "height": 180,  "fps": 30, "delay": 5, "duration": 20},
     },
 }
 
@@ -382,9 +1087,10 @@ class PinballRecorder(tk.Tk):
         self.cfg        = cli_config if cli_config is not None else load_config()
         self.processes  = []
         self.recording  = False
-        self._win_map   = {}
-        self._monitors  = []
-        self._overlays  = {}
+        self._win_map              = {}
+        self._monitors             = []
+        self._overlays             = {}
+        self._app_audio_window_map = {}   # title → pid, populated by _refresh_app_audio_list
 
         self._pinup_game_data    = []   # list of game dicts {display, rom, media_dir, emulator}
         self._pinup_display_map = {}   # display name  → game dict
@@ -392,6 +1098,7 @@ class PinballRecorder(tk.Tk):
         self._recording_files     = {}   # screen_name -> file path for last recording
         self._recording_cfg       = {}   # snapshot of cfg used for last recording
         self._f9_was_down         = False
+        self._f8_was_down         = False
         self._log_fh              = None  # open file handle when log-to-file is on
         self.prefs       = load_prefs()
         self.ffmpeg_path = self.prefs.get("ffmpeg_path") or ""
@@ -414,6 +1121,8 @@ class PinballRecorder(tk.Tk):
         self._update_title()
         self._refresh_windows()
         self._refresh_audio_devices()
+        self._refresh_app_audio_list(
+            restore_titles=self.cfg.get("audio_app_windows", []))
 
         _first_run = not os.path.exists(CONFIG_FILE)
         self._auto_detect_monitors(force_assign=_first_run)
@@ -438,6 +1147,9 @@ class PinballRecorder(tk.Tk):
         self.after(200, self._poll_hotkey)
 
         if self.ffmpeg_path:
+            self.ffmpeg_path = self._resolve_ffmpeg_path()
+            if hasattr(self, "ffmpeg_var"):
+                self.ffmpeg_var.set(self.ffmpeg_path)
             self._log(f"FFmpeg: {self.ffmpeg_path}")
             self.after(500, self._get_ffmpeg_info)
         else:
@@ -581,8 +1293,29 @@ class PinballRecorder(tk.Tk):
                 self._file_menu_cfg_label_idx,
                 label=f"  📄 {name}")
 
+    def _monitor_by_label(self, label, monitors=None):
+        """Return the monitor dict matching a label like 'Monitor 2', or the first monitor."""
+        if monitors is None:
+            monitors = enum_display_monitors()
+        for i, m in enumerate(monitors):
+            if f"Monitor {i + 1}" in label:
+                return m
+        return monitors[0] if monitors else {"x": 0, "y": 0, "width": 1920, "height": 1080, "primary": True}
+
+    def _migrate_config_coords(self, cfg):
+        """Convert absolute coords in old configs (pre-coords_v2) to monitor-relative."""
+        monitors = enum_display_monitors()
+        for screen, sv in cfg.get("screens", {}).items():
+            label = sv.get("monitor", "")
+            mon = self._monitor_by_label(label, monitors)
+            sv["x"] = sv.get("x", 0) - mon["x"]
+            sv["y"] = sv.get("y", 0) - mon["y"]
+        cfg["coords_v2"] = True
+
     def _apply_config(self, cfg, path=None):
         """Load cfg dict into all UI widgets and update state."""
+        if not cfg.get("coords_v2"):
+            self._migrate_config_coords(cfg)
         self.cfg = cfg
         self._config_path = path
         for name in SCREENS:
@@ -600,7 +1333,10 @@ class PinballRecorder(tk.Tk):
         self.output_folder_var.set(cfg.get("output_folder", ""))
         self.prefix_var.set(cfg.get("file_prefix", "pinball"))
         self.audio_enabled.set(cfg.get("audio_enabled", True))
+        self.audio_capture_mode_var.set(cfg.get("audio_capture_mode", "device"))
+        self._toggle_audio_mode()
         self.audio_device_var.set(cfg.get("audio_device", ""))
+        self._refresh_app_audio_list(restore_titles=cfg.get("audio_app_windows", []))
         self.audio_delay_var.set(str(cfg.get("audio_delay", 0)))
         self.audio_duration_var.set(str(cfg.get("audio_duration", 0)))
         self.audio_match_var.set(cfg.get("audio_match_screen", ""))
@@ -763,8 +1499,14 @@ class PinballRecorder(tk.Tk):
         self.pinup_game_combo = ttk.Combobox(frame, textvariable=self.pinup_game_var,
                                               width=42, state="readonly")
         self.pinup_game_combo.grid(row=0, column=1, sticky="ew")
-        self._pinup_refresh_btn = self._btn(frame, "Refresh", self._load_pinup_db)
-        self._pinup_refresh_btn.grid(row=0, column=2, padx=(4, 0))
+        btn_col = tk.Frame(frame, bg=BG)
+        btn_col.grid(row=0, column=2, padx=(4, 0))
+        self._pinup_refresh_btn = self._btn(btn_col, "Refresh", self._load_pinup_db)
+        self._pinup_refresh_btn.pack(side="left")
+        self._pinup_clear_btn = self._btn(btn_col, "Clear",
+                                          lambda: self.pinup_game_var.set(""),
+                                          fg="#f38ba8")
+        self._pinup_clear_btn.pack(side="left", padx=(4, 0))
 
         # ── Row 1: Status label ──────────────────────────────────────────────
         self.pinup_status_var = tk.StringVar(value="")
@@ -813,11 +1555,18 @@ class PinballRecorder(tk.Tk):
         self.pinup_game_var.trace_add("write", self._schedule_save)
         self.pinup_game_var.trace_add("write", lambda *_: self._update_pinup_preview())
 
+    def _resolve_ffmpeg_path(self, path=None):
+        """Return an absolute path to ffmpeg, resolving relative paths against _APP_DIR."""
+        p = path if path is not None else self.ffmpeg_path
+        if p and not os.path.isabs(p):
+            p = os.path.normpath(os.path.join(_APP_DIR, p))
+        return p
+
     def _update_ffmpeg_state(self):
         """Enable or disable the Start button based on whether FFmpeg is configured."""
         if not hasattr(self, "start_btn") or self.recording:
             return
-        ok = bool(self.ffmpeg_path and os.path.isfile(self.ffmpeg_path))
+        ok = bool(self.ffmpeg_path and os.path.isfile(self._resolve_ffmpeg_path()))
         if ok:
             self.start_btn.configure(state="normal", bg=BTN_GREEN, fg="#1e1e2e", cursor="hand2")
         else:
@@ -959,6 +1708,62 @@ class PinballRecorder(tk.Tk):
             row=r, column=2, padx=(4, 0), pady=(10, 0))
         r += 1
 
+        # ── Ignored audio applications ────────────────────────────────────────
+        ttk.Separator(frm).grid(row=r, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        r += 1
+        tk.Label(frm, text="IGNORED AUDIO APPS", bg=BG, fg=ACCENT,
+                 font=("Segoe UI", 8, "bold")).grid(
+            row=r, column=0, columnspan=3, sticky="w", pady=(6, 4))
+        r += 1
+        tk.Label(frm, text="Hidden from the\nApplication capture list:",
+                 bg=BG, fg=FG, justify="left").grid(
+            row=r, column=0, sticky="nw", padx=(0, 6))
+
+        _ign_outer = tk.Frame(frm, bg=BG)
+        _ign_outer.grid(row=r, column=1, sticky="ew")
+        _ign_outer.columnconfigure(0, weight=1)
+        local_ignored = list(self.prefs.get("ignored_audio_apps",
+                                            sorted(_UNSUPPORTED_APP_AUDIO_EXES)))
+        _ign_lb = tk.Listbox(
+            _ign_outer, height=5,
+            bg=FRAME_BG, fg=FG,
+            selectbackground=ACCENT, selectforeground=BG,
+            font=("Segoe UI", 9), relief="flat", bd=1,
+            highlightthickness=1, highlightcolor=ACCENT,
+            exportselection=False,
+        )
+        _ign_lb.grid(row=0, column=0, sticky="ew")
+        _ign_sb = ttk.Scrollbar(_ign_outer, orient="vertical",
+                                 command=_ign_lb.yview)
+        _ign_sb.grid(row=0, column=1, sticky="ns")
+        _ign_lb.configure(yscrollcommand=_ign_sb.set)
+
+        def _ign_rebuild():
+            _ign_lb.delete(0, tk.END)
+            for exe in local_ignored:
+                _ign_lb.insert(tk.END, exe)
+
+        _ign_rebuild()
+
+        _ign_btns = tk.Frame(frm, bg=BG)
+        _ign_btns.grid(row=r, column=2, sticky="nw", padx=(4, 0))
+
+        def _ign_remove():
+            for i in reversed(_ign_lb.curselection()):
+                local_ignored.pop(i)
+            _ign_rebuild()
+
+        def _ign_restore():
+            local_ignored.clear()
+            local_ignored.extend(sorted(_UNSUPPORTED_APP_AUDIO_EXES))
+            _ign_rebuild()
+
+        self._btn(_ign_btns, "Remove", _ign_remove, fg=FG, padx=8).pack(
+            pady=(0, 4), fill="x")
+        self._btn(_ign_btns, "Restore\nDefaults", _ign_restore, fg=FG, padx=8).pack(
+            fill="x")
+        r += 1
+
         # ── Separator + buttons ───────────────────────────────────────────────
         ttk.Separator(frm).grid(row=r, column=0, columnspan=3, sticky="ew", pady=(14, 0))
         r += 1
@@ -967,13 +1772,14 @@ class PinballRecorder(tk.Tk):
 
         def _apply():
             new_ffmpeg = ffmpeg_var_dlg.get()
-            self.prefs["ffmpeg_path"]       = new_ffmpeg
-            self.ffmpeg_path                = new_ffmpeg
+            self.prefs["ffmpeg_path"]        = new_ffmpeg
+            self.ffmpeg_path                 = new_ffmpeg
             self.ffmpeg_var.set(new_ffmpeg)  # triggers info detection via trace
-            self.prefs["pinup_db_path"]     = db_var.get()
-            self.prefs["open_folder_after"] = open_var.get()
-            self.prefs["log_to_file"]       = log_var.get()
-            self.prefs["recent_files"]      = local_recent
+            self.prefs["pinup_db_path"]      = db_var.get()
+            self.prefs["open_folder_after"]  = open_var.get()
+            self.prefs["log_to_file"]        = log_var.get()
+            self.prefs["recent_files"]       = local_recent
+            self.prefs["ignored_audio_apps"] = list(local_ignored)
             save_prefs(self.prefs)
             # Sync in-memory tk vars so recording and log logic picks up changes
             self.pinup_db_var.set(db_var.get())
@@ -981,6 +1787,7 @@ class PinballRecorder(tk.Tk):
             self.log_to_file_var.set(log_var.get())
             self._rebuild_recent_menu()
             self._update_ffmpeg_state()
+            self._refresh_app_audio_list()
             dlg.destroy()
 
         self._btn(btn_row, "OK", _apply,
@@ -995,6 +1802,8 @@ class PinballRecorder(tk.Tk):
             self.pinup_game_combo.configure(state="readonly" if _db_ok else "disabled")
         if hasattr(self, "_pinup_refresh_btn"):
             self._pinup_refresh_btn.configure(state="normal" if _db_ok else "disabled")
+        if hasattr(self, "_pinup_clear_btn"):
+            self._pinup_clear_btn.configure(state="normal" if _db_ok else "disabled")
         if not _db_ok:
             if hasattr(self, "pinup_status_var"):
                 self.pinup_status_var.set(
@@ -1078,7 +1887,8 @@ class PinballRecorder(tk.Tk):
     # ── FFmpeg Info ────────────────────────────────────────────────────────────
 
     def _get_ffmpeg_info(self):
-        ffmpeg = self.ffmpeg_var.get() if hasattr(self, "ffmpeg_var") else self.ffmpeg_path
+        ffmpeg = self._resolve_ffmpeg_path(
+            self.ffmpeg_var.get() if hasattr(self, "ffmpeg_var") else self.ffmpeg_path)
         if not ffmpeg or not os.path.exists(ffmpeg):
             return
         def _run():
@@ -1102,18 +1912,38 @@ class PinballRecorder(tk.Tk):
                 pass
         threading.Thread(target=_run, daemon=True).start()
 
-    # ── Global Stop Hotkey (F9) ────────────────────────────────────────────────
+    # ── Global Hotkeys (F8 = start, F9 = stop) ─────────────────────────────────
 
     def _poll_hotkey(self):
-        """Poll F9 every 100 ms — works even when the app window is not focused."""
+        """Poll F8/F9 every 100 ms — works even when the app window is not focused."""
         try:
-            pressed = bool(ctypes.windll.user32.GetAsyncKeyState(0x78) & 0x8000)  # VK_F9
-            if pressed and not self._f9_was_down and self.recording:
+            GetAsyncKeyState = ctypes.windll.user32.GetAsyncKeyState
+            f8 = bool(GetAsyncKeyState(0x77) & 0x8000)  # VK_F8
+            f9 = bool(GetAsyncKeyState(0x78) & 0x8000)  # VK_F9
+
+            if f8 and not self._f8_was_down and not self.recording:
+                threading.Thread(target=self._f8_start, daemon=True).start()
+            if f9 and not self._f9_was_down and self.recording:
                 self.after(0, self._stop_recording)
-            self._f9_was_down = pressed
+
+            self._f8_was_down = f8
+            self._f9_was_down = f9
         except Exception:
             pass
         self.after(100, self._poll_hotkey)
+
+    def _f8_start(self):
+        """Play a short acknowledgement beep, then start recording.
+        Runs in a background thread so the sound fully completes before any
+        capture begins — safe even when all recording delays are zero.
+        """
+        try:
+            import winsound
+            winsound.Beep(440, 100)
+            winsound.Beep(660, 150)
+        except Exception:
+            pass
+        self.after(0, self._start_recording)
 
     # ── Log File ──────────────────────────────────────────────────────────────
 
@@ -1299,24 +2129,82 @@ class PinballRecorder(tk.Tk):
 
         # Row 0: enable checkbox
         self.audio_enabled = tk.BooleanVar(value=self.cfg.get("audio_enabled", True))
-        tk.Checkbutton(frame, text="Record system audio output to a separate MP3",
+        tk.Checkbutton(frame, text="Record audio to a separate MP3",
                        variable=self.audio_enabled,
                        bg=BG, fg=FG, activebackground=BG, selectcolor=FRAME_BG).grid(
             row=0, column=0, columnspan=4, sticky="w")
 
-        # Row 1: device
-        tk.Label(frame, text="Capture Device:", bg=BG, fg=FG).grid(
-            row=1, column=0, sticky="w", padx=(0, 6), pady=(6, 0))
-        self.audio_device_var = tk.StringVar(value=self.cfg.get("audio_device", ""))
-        self.audio_combo = ttk.Combobox(frame, textvariable=self.audio_device_var,
-                                         width=44, state="readonly")
-        self.audio_combo.grid(row=1, column=1, columnspan=2, sticky="ew", pady=(6, 0))
-        self._btn(frame, "Refresh", self._refresh_audio_devices).grid(
-            row=1, column=3, padx=(4, 0), pady=(6, 0))
+        # Row 1: capture mode radio buttons
+        self.audio_capture_mode_var = tk.StringVar(
+            value=self.cfg.get("audio_capture_mode", "device"))
+        _mode_row = tk.Frame(frame, bg=BG)
+        _mode_row.grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        tk.Label(_mode_row, text="Capture Mode:", bg=BG, fg=FG).pack(side="left", padx=(0, 8))
+        tk.Radiobutton(_mode_row, text="Device", variable=self.audio_capture_mode_var,
+                       value="device", bg=BG, fg=FG, activebackground=BG,
+                       selectcolor=FRAME_BG,
+                       command=self._toggle_audio_mode).pack(side="left", padx=(0, 6))
+        tk.Radiobutton(_mode_row, text="Application", variable=self.audio_capture_mode_var,
+                       value="application", bg=BG, fg=FG, activebackground=BG,
+                       selectcolor=FRAME_BG,
+                       command=self._toggle_audio_mode).pack(side="left")
 
-        # Row 2: Delay / Duration / Match-screen — flat single row
+        # Row 2: device frame (shown in device mode)
+        self._audio_device_frame = tk.Frame(frame, bg=BG)
+        self._audio_device_frame.grid(row=2, column=0, columnspan=4,
+                                       sticky="ew", pady=(6, 0))
+        self._audio_device_frame.columnconfigure(1, weight=1)
+        tk.Label(self._audio_device_frame, text="Capture Device:",
+                 bg=BG, fg=FG).grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.audio_device_var = tk.StringVar(value=self.cfg.get("audio_device", ""))
+        self.audio_combo = ttk.Combobox(self._audio_device_frame,
+                                         textvariable=self.audio_device_var,
+                                         width=44, state="readonly")
+        self.audio_combo.grid(row=0, column=1, sticky="ew")
+        self._btn(self._audio_device_frame, "Refresh",
+                  self._refresh_audio_devices).grid(row=0, column=2, padx=(4, 0))
+
+        # Row 3: application frame (shown in application mode)
+        self._audio_app_frame = tk.Frame(frame, bg=BG)
+        self._audio_app_frame.grid(row=3, column=0, columnspan=4,
+                                    sticky="ew", pady=(6, 0))
+        self._audio_app_frame.columnconfigure(0, weight=1)
+
+        _app_hdr = tk.Frame(self._audio_app_frame, bg=BG)
+        _app_hdr.grid(row=0, column=0, sticky="ew")
+        _app_hdr.columnconfigure(0, weight=1)
+        tk.Label(_app_hdr,
+                 text="Applications (select one or more — Ctrl+click for multi-select):",
+                 bg=BG, fg=FG).grid(row=0, column=0, sticky="w")
+        self._btn(_app_hdr, "Refresh",
+                  self._refresh_app_audio_list).grid(row=0, column=1, padx=(4, 0))
+
+        _lb_frame = tk.Frame(self._audio_app_frame, bg=BG)
+        _lb_frame.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        _lb_frame.columnconfigure(0, weight=1)
+        self._app_audio_listbox = tk.Listbox(
+            _lb_frame, selectmode=tk.EXTENDED, height=4,
+            bg=FRAME_BG, fg=FG,
+            selectbackground=ACCENT, selectforeground=BG,
+            font=("Segoe UI", 9), activestyle="none",
+            relief="flat", bd=1,
+            highlightthickness=1, highlightcolor=ACCENT,
+        )
+        self._app_audio_listbox.grid(row=0, column=0, sticky="ew")
+        _sb = ttk.Scrollbar(_lb_frame, orient="vertical",
+                             command=self._app_audio_listbox.yview)
+        _sb.grid(row=0, column=1, sticky="ns")
+        self._app_audio_listbox.configure(yscrollcommand=_sb.set)
+        self._app_audio_listbox.bind("<<ListboxSelect>>",
+                                      lambda e: self._schedule_save())
+        self._app_audio_listbox.bind("<Button-3>", self._on_audio_app_right_click)
+
+        # Set initial visibility based on saved mode
+        self._toggle_audio_mode()
+
+        # Row 4: Delay / Duration / Match-screen — flat single row
         _timing = tk.Frame(frame, bg=BG)
-        _timing.grid(row=2, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        _timing.grid(row=4, column=0, columnspan=4, sticky="w", pady=(6, 0))
 
         tk.Label(_timing, text="Delay (s):", bg=BG, fg=FG).pack(side="left", padx=(0, 6))
         self.audio_delay_var = tk.StringVar(value=str(self.cfg.get("audio_delay", 0)))
@@ -1355,7 +2243,8 @@ class PinballRecorder(tk.Tk):
         # Apply initial state in case config restored a match
         self.after(100, _on_match_screen)
 
-        for _v in (self.audio_enabled, self.audio_device_var,
+        for _v in (self.audio_enabled, self.audio_capture_mode_var,
+                   self.audio_device_var,
                    self.audio_delay_var, self.audio_duration_var, self.audio_match_var):
             _v.trace_add("write", self._schedule_save)
 
@@ -1423,8 +2312,12 @@ class PinballRecorder(tk.Tk):
         self.window_var = tk.StringVar(value=self.cfg.get("window_title", ""))
         self.window_combo = ttk.Combobox(frame, textvariable=self.window_var, width=36)
         self.window_combo.grid(row=0, column=1, sticky="ew")
-        self._btn(frame, "Refresh", self._refresh_windows).grid(
-            row=0, column=2, padx=(4, 0))
+        win_btn_col = tk.Frame(frame, bg=BG)
+        win_btn_col.grid(row=0, column=2, padx=(4, 0))
+        self._btn(win_btn_col, "Refresh", self._refresh_windows).pack(side="left")
+        self._btn(win_btn_col, "Clear",
+                  lambda: self.window_var.set(""),
+                  fg="#f38ba8").pack(side="left", padx=(4, 0))
         self.window_var.trace_add("write", self._schedule_save)
 
     def _build_controls(self, parent, pad):
@@ -1450,7 +2343,7 @@ class PinballRecorder(tk.Tk):
 
         self._btn(frame, "♥  Donate", lambda: webbrowser.open(DONATE_URL),
                   fg="#f38ba8", font=("Segoe UI", 8), padx=8, pady=4).pack(side="right")
-        tk.Label(frame, text="F9 = stop", bg=BG, fg="#585b70",
+        tk.Label(frame, text="F8 = start  |  F9 = stop", bg=BG, fg="#585b70",
                  font=("Segoe UI", 8)).pack(side="right", padx=(0, 10))
 
     def _build_log(self, parent):
@@ -1517,11 +2410,12 @@ class PinballRecorder(tk.Tk):
             return
         v = self.screen_vars[name]
         try:
-            x = int(v["x"].get() or 0)
-            y = int(v["y"].get() or 0)
+            rel_x = int(v["x"].get() or 0)
+            rel_y = int(v["y"].get() or 0)
             w = max(1, int(v["width"].get() or 1))
             h = max(1, int(v["height"].get() or 1))
-            ov.geometry(f"{w}x{h}+{x}+{y}")
+            mon = self._monitor_by_label(v["monitor"].get(), self._monitors)
+            ov.geometry(f"{w}x{h}+{mon['x'] + rel_x}+{mon['y'] + rel_y}")
         except (ValueError, tk.TclError):
             pass
 
@@ -1549,19 +2443,12 @@ class PinballRecorder(tk.Tk):
             v   = self.screen_vars[name]
             has_saved = name in saved_screens
             if force_assign or not has_saved:
-                v["x"].set(str(mon["x"]))
-                v["y"].set(str(mon["y"]))
+                v["x"].set("0")
+                v["y"].set("0")
                 v["width"].set(str(mon["width"]))
                 v["height"].set(str(mon["height"]))
                 v["monitor"].set(f"Monitor {idx + 1}")
                 self._log(f"  → {name} assigned to Monitor {idx + 1}")
-            else:
-                # Just update the monitor label to match saved coordinates if possible
-                for i, m in enumerate(self._monitors):
-                    if (m["x"] == int(v["x"].get() or 0) and
-                            m["y"] == int(v["y"].get() or 0)):
-                        v["monitor"].set(f"Monitor {i + 1}")
-                        break
 
     def _on_monitor_selected(self, name):
         """Auto-fill X/Y/W/H when user picks a monitor from the dropdown."""
@@ -1570,8 +2457,8 @@ class PinballRecorder(tk.Tk):
         try:
             idx = int(sel.split()[1]) - 1
             mon = self._monitors[idx]
-            v["x"].set(str(mon["x"]))
-            v["y"].set(str(mon["y"]))
+            v["x"].set("0")
+            v["y"].set("0")
             v["width"].set(str(mon["width"]))
             v["height"].set(str(mon["height"]))
         except (IndexError, ValueError):
@@ -1595,14 +2482,18 @@ class PinballRecorder(tk.Tk):
 
     def _show_preview_overlay(self, name):
         """Open a transparent, borderless, draggable/resizable overlay to set the capture region."""
+        self._monitors = enum_display_monitors()
         v = self.screen_vars[name]
         try:
-            x = int(v["x"].get() or 0)
-            y = int(v["y"].get() or 0)
+            rel_x = int(v["x"].get() or 0)
+            rel_y = int(v["y"].get() or 0)
             w = int(v["width"].get()  or 800)
             h = int(v["height"].get() or 600)
         except ValueError:
-            x, y, w, h = 0, 0, 800, 600
+            rel_x, rel_y, w, h = 0, 0, 800, 600
+        mon = self._monitor_by_label(v["monitor"].get(), self._monitors)
+        x = mon["x"] + rel_x
+        y = mon["y"] + rel_y
 
         color  = SCREEN_COLOR.get(name, ACCENT)
         DARK   = "#1e1e2e"
@@ -1702,30 +2593,35 @@ class PinballRecorder(tk.Tk):
         tk.Frame(btn_bar, bg=color, width=4).pack(side="left", fill="y")
 
         def _snap_full_screen():
+            self._monitors = enum_display_monitors()
             mon = self._get_monitor_for_overlay(ov)
             if mon:
                 ov.geometry(f"{mon['width']}x{mon['height']}+{mon['x']}+{mon['y']}")
                 _update_dims()
 
         def _snap_full_width():
+            self._monitors = enum_display_monitors()
             mon = self._get_monitor_for_overlay(ov)
             if mon:
                 ov.geometry(f"{mon['width']}x{ov.winfo_height()}+{mon['x']}+{ov.winfo_y()}")
                 _update_dims()
 
         def _snap_full_height():
+            self._monitors = enum_display_monitors()
             mon = self._get_monitor_for_overlay(ov)
             if mon:
                 ov.geometry(f"{ov.winfo_width()}x{mon['height']}+{ov.winfo_x()}+{mon['y']}")
                 _update_dims()
 
         def _snap_top_half():
+            self._monitors = enum_display_monitors()
             mon = self._get_monitor_for_overlay(ov)
             if mon:
                 ov.geometry(f"{mon['width']}x{mon['height']//2}+{mon['x']}+{mon['y']}")
                 _update_dims()
 
         def _snap_bottom_half():
+            self._monitors = enum_display_monitors()
             mon = self._get_monitor_for_overlay(ov)
             if mon:
                 half = mon["height"] // 2
@@ -1761,13 +2657,17 @@ class PinballRecorder(tk.Tk):
         # ── Bottom bar ────────────────────────────────────────────────────────
         def _apply():
             ov.update_idletasks()
-            v["x"].set(str(ov.winfo_x()))
-            v["y"].set(str(ov.winfo_y()))
-            v["width"].set(str(ov.winfo_width()))
-            v["height"].set(str(ov.winfo_height()))
+            monitors = enum_display_monitors()
+            self._monitors = monitors
             mon = self._get_monitor_for_overlay(ov)
             if mon and mon in self._monitors:
                 v["monitor"].set(f"Monitor {self._monitors.index(mon) + 1}")
+            else:
+                mon = self._monitors[0] if self._monitors else {"x": 0, "y": 0}
+            v["x"].set(str(ov.winfo_x() - mon["x"]))
+            v["y"].set(str(ov.winfo_y() - mon["y"]))
+            v["width"].set(str(ov.winfo_width()))
+            v["height"].set(str(ov.winfo_height()))
             self._close_overlay(name)
             self._log(f"Preview applied \u2192 {name}: "
                       f"{v['width'].get()}\u00d7{v['height'].get()} @ ({v['x'].get()}, {v['y'].get()})")
@@ -2069,6 +2969,122 @@ class PinballRecorder(tk.Tk):
         else:
             self._log("⚠  No audio input devices found.")
 
+    def _toggle_audio_mode(self):
+        """Show/hide device vs application capture frames based on current mode."""
+        if self.audio_capture_mode_var.get() == "device":
+            self._audio_device_frame.grid()
+            self._audio_app_frame.grid_remove()
+        else:
+            self._audio_device_frame.grid_remove()
+            self._audio_app_frame.grid()
+
+    def _get_audio_app_windows(self):
+        """Return list of currently selected window titles from the app listbox."""
+        try:
+            return [self._app_audio_listbox.get(i)
+                    for i in self._app_audio_listbox.curselection()]
+        except Exception:
+            return []
+
+    def _refresh_app_audio_list(self, restore_titles=None):
+        """Repopulate the application audio listbox from visible windows.
+        restore_titles: list of titles to pre-select; None = preserve current selection.
+        """
+        if restore_titles is None:
+            old_sel = set(self._get_audio_app_windows())
+        else:
+            old_sel = set(restore_titles)
+
+        windows = enum_windows_with_pid()
+        pid_info = _build_pid_info_map()  # {pid: (parent_pid, exe_lower)}
+
+        # Only show windows whose process has an active WASAPI render session —
+        # a prerequisite for Application Loopback capture. Expand to include the
+        # direct parent of each session PID (audio workers are often children).
+        # If no sessions are active at all, fall back to showing everything.
+        active_pids = _get_wasapi_active_pids()
+        if active_pids:
+            expanded = set(active_pids)
+            for spid in active_pids:
+                parent = pid_info.get(spid, (0, ""))[0]
+                if parent:
+                    expanded.add(parent)
+        else:
+            expanded = set()
+
+        ignored = set(self.prefs.get("ignored_audio_apps",
+                                     sorted(_UNSUPPORTED_APP_AUDIO_EXES)))
+        self._app_audio_window_map = {}
+        self._app_audio_title_to_exe = {}
+        entries = []
+        seen = set()
+        for _hwnd, title, pid in windows:
+            if not title or not title.strip() or title in seen:
+                continue
+            exe = pid_info.get(pid, (0, ""))[1]
+            if exe in ignored:
+                continue
+            if expanded and pid not in expanded:
+                continue
+            seen.add(title)
+            self._app_audio_window_map[title] = pid
+            self._app_audio_title_to_exe[title] = exe
+            entries.append(title)
+
+        self._app_audio_listbox.delete(0, tk.END)
+        for title in entries:
+            self._app_audio_listbox.insert(tk.END, title)
+
+        for i, title in enumerate(entries):
+            if title in old_sel:
+                self._app_audio_listbox.selection_set(i)
+
+        if expanded:
+            self._log(f"Found {len(entries)} window(s) with active audio for capture"
+                      " (refresh while app is playing to detect it)")
+        else:
+            self._log(f"Found {len(entries)} open window(s) for audio capture"
+                      " (no active audio detected — showing all)")
+
+    def _on_audio_app_right_click(self, event):
+        """Right-click context menu on the application audio listbox."""
+        lb = self._app_audio_listbox
+        idx = lb.nearest(event.y)
+        if idx < 0 or idx >= lb.size():
+            return
+        lb.selection_clear(0, tk.END)
+        lb.selection_set(idx)
+        title = lb.get(idx)
+        exe = self._app_audio_title_to_exe.get(title, "")
+
+        menu = tk.Menu(self, tearoff=0, bg=FRAME_BG, fg=FG,
+                       activebackground=ACCENT, activeforeground=BG,
+                       relief="flat")
+
+        def _ignore():
+            ignored = list(self.prefs.get("ignored_audio_apps",
+                                          sorted(_UNSUPPORTED_APP_AUDIO_EXES)))
+            if exe and exe not in ignored:
+                ignored.append(exe)
+                ignored.sort()
+                self.prefs["ignored_audio_apps"] = ignored
+                save_prefs(self.prefs)
+                self._log(f"Ignored: {exe} — hidden from application audio list"
+                          " (manage in File → Preferences)")
+            self._refresh_app_audio_list()
+
+        if exe:
+            menu.add_command(label=f"Ignore '{exe}' — hide from list", command=_ignore)
+        else:
+            menu.add_command(label="(process not identifiable)", state="disabled")
+        menu.add_separator()
+        menu.add_command(label="Manage ignored apps…",
+                         command=self._show_preferences)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
     def _refresh_windows(self):
         windows = enum_windows()
         self._win_map = {title: hwnd for hwnd, title in windows}
@@ -2128,7 +3144,9 @@ class PinballRecorder(tk.Tk):
             "output_folder":        self.output_folder_var.get(),
             "file_prefix":          self.prefix_var.get(),
             "audio_enabled":        self.audio_enabled.get(),
+            "audio_capture_mode":   self.audio_capture_mode_var.get(),
             "audio_device":         self.audio_device_var.get(),
+            "audio_app_windows":    self._get_audio_app_windows(),
             "audio_delay":          int(self.audio_delay_var.get()    or 0),
             "audio_duration":       int(self.audio_duration_var.get() or 0),
             "audio_match_screen":   self.audio_match_var.get(),
@@ -2136,13 +3154,14 @@ class PinballRecorder(tk.Tk):
             "pinup_game_media_dir": self._get_pinup_media_dir(),
             "pinup_game_rom":       self._get_pinup_rom(),
             "pinup_also_save":      self.pinup_also_save_var.get(),
+            "coords_v2":            True,
             "screens":              screens,
         }
 
     # ── Recording ──────────────────────────────────────────────────────────────
 
     def _start_recording(self):
-        self.ffmpeg_path = self.ffmpeg_var.get()
+        self.ffmpeg_path = self._resolve_ffmpeg_path(self.ffmpeg_var.get())
         if not self.ffmpeg_path:
             self._show_ffmpeg_setup()
             return
@@ -2226,18 +3245,24 @@ class PinballRecorder(tk.Tk):
         # ── Video streams ──────────────────────────────────────────────────────
         # Each screen starts in its own thread so their delays run in parallel
         # and each stream begins at the correct time relative to t_ref.
+        live_monitors = enum_display_monitors()
         for name in SCREENS:
             s = cfg["screens"][name]
             if not s["enabled"]:
                 continue
+
+            # Convert monitor-relative coords to global desktop coords for gdigrab
+            mon = self._monitor_by_label(s.get("monitor", ""), live_monitors)
+            offset_x = mon["x"] + s["x"]
+            offset_y = mon["y"] + s["y"]
 
             out_file = os.path.join(out_dir, f"{prefix}_{name}_{ts}.mp4")
             cmd = [
                 ffmpeg, "-y",
                 "-f",          "gdigrab",
                 "-framerate",  str(s["fps"]),
-                "-offset_x",   str(s["x"]),
-                "-offset_y",   str(s["y"]),
+                "-offset_x",   str(offset_x),
+                "-offset_y",   str(offset_y),
                 "-video_size", f"{s['width']}x{s['height']}",
                 "-draw_mouse", "0",
                 "-i",          "desktop",
@@ -2305,21 +3330,100 @@ class PinballRecorder(tk.Tk):
             aud_duration = max(all_durs) if all_durs else 0
         duration = aud_duration
         if cfg["audio_enabled"]:
-            device   = cfg["audio_device"]
-            aud_mp3  = os.path.join(out_dir, f"{prefix}_Audio_{ts}.mp3")
-            self._log(f"▶ Audio  →  {os.path.basename(aud_mp3)}")
-            self._log(f"  device: {device or '(system default)'}")
-
+            device        = cfg["audio_device"]
+            capture_mode  = cfg.get("audio_capture_mode", "device")
+            aud_mp3       = os.path.join(out_dir, f"{prefix}_Audio_{ts}.mp3")
             loopback_meta = getattr(self, "_loopback_meta", {})
 
             if aud_delay > 0:
                 aud_remaining = max(0.0, aud_delay - (time.time() - t_ref))
                 if aud_remaining > 0:
-                    self._log(f"  delay: {aud_remaining:.0f}s")
+                    self._log(f"  delay (audio): {aud_remaining:.0f}s")
                     time.sleep(aud_remaining)
 
-            if device in loopback_meta:
+            if capture_mode == "application":
+                # ── Application loopback (per-process, full volume) ───────────
+                selected_titles = cfg.get("audio_app_windows", [])
+                if not selected_titles:
+                    self._log("  ⚠ Audio: no applications selected for capture")
+                else:
+                    windows_now   = enum_windows_with_pid()
+                    title_to_pid  = {t: p for _, t, p in windows_now if t.strip()}
+                    seen_pids     = set()
+                    pid_list      = []
+                    for title in selected_titles:
+                        pid = title_to_pid.get(title)
+                        if not pid:
+                            # Window title may have changed (e.g. Discord updates
+                            # title with channel name). Fall back to the PID that
+                            # was stored when the user made the selection.
+                            pid = self._app_audio_window_map.get(title)
+                            if pid:
+                                self._log(f"  ℹ Audio window title changed; "
+                                          f"using stored PID {pid} for: {title!r}")
+                        if pid and pid not in seen_pids:
+                            seen_pids.add(pid)
+                            pid_list.append((pid, title))
+                        elif not pid:
+                            self._log(f"  ⚠ Window not found for audio: {title!r}")
+
+                    if not pid_list:
+                        self._log("  ⚠ No matching windows found for application audio")
+                    else:
+                        stop_evt  = threading.Event()
+                        wav_files = []
+                        threads   = []
+
+                        for i, (pid, title) in enumerate(pid_list):
+                            root_pid = _find_root_audio_pid(pid)
+                            if root_pid != pid:
+                                self._log(f"  resolved PID {pid} → root PID {root_pid}")
+                            wav_path = aud_mp3.replace(".mp3", f"_appraw{i}.wav")
+                            wav_files.append(wav_path)
+                            pid = root_pid
+                            self._log(f"▶ Audio [{title}]  →  PID {pid}")
+
+                            def _capture_app(p=pid, w=wav_path,
+                                             se=stop_evt, dur=duration):
+                                try:
+                                    _app_loopback_subprocess(
+                                        p, w, se, dur,
+                                        on_log=lambda m: self.after(0, self._log, m))
+                                except Exception as exc:
+                                    self.after(0, self._log,
+                                               f"  ⚠ App loopback error (PID {p}): {exc}")
+
+                            t = threading.Thread(target=_capture_app, daemon=True)
+                            t.start()
+                            threads.append(t)
+
+                        def _coordinator(ts=threads):
+                            for th in ts:
+                                th.join(timeout=120)
+
+                        coord = threading.Thread(target=_coordinator, daemon=True)
+                        coord.start()
+
+                        self._log(f"▶ Audio  →  {os.path.basename(aud_mp3)}")
+                        self._log(f"  mode: application loopback "
+                                  f"({len(pid_list)} process(es))")
+                        self.processes.append({
+                            "name":         "Audio",
+                            "proc":         None,
+                            "file":         aud_mp3,
+                            "wav_files":    wav_files,
+                            "stop_evt":     stop_evt,
+                            "thread":       coord,
+                            "ffmpeg":       ffmpeg,
+                            "err_buf":      [],
+                            "capture_mode": "application",
+                        })
+                        self._recording_files["Audio"] = aud_mp3
+
+            elif device in loopback_meta:
                 # ── WASAPI loopback via pyaudiowpatch ────────────────────────
+                self._log(f"▶ Audio  →  {os.path.basename(aud_mp3)}")
+                self._log(f"  device: {device}")
                 dev_idx, channels, sample_rate = loopback_meta[device]
                 aud_wav = aud_mp3.replace(".mp3", "_raw.wav")
                 stop_evt = threading.Event()
@@ -2386,6 +3490,8 @@ class PinballRecorder(tk.Tk):
                 self._recording_files["Audio"] = aud_mp3
             else:
                 # ── dshow fallback (Stereo Mix / microphone) ──────────────────
+                self._log(f"▶ Audio  →  {os.path.basename(aud_mp3)}")
+                self._log(f"  device: {device or '(system default)'}")
                 aud_cmd = [
                     ffmpeg, "-y",
                     "-f",                "dshow",
@@ -2473,7 +3579,60 @@ class PinballRecorder(tk.Tk):
             err_buf = entry.get("err_buf", [])
             self.after(0, self._log, f"  ⏳ Finalizing: {os.path.basename(path)}")
 
-            if entry.get("stop_evt"):  # ── loopback capture thread ──
+            if entry.get("capture_mode") == "application":  # ── app loopback ──
+                t = entry.get("thread")
+                if t:
+                    t.join(timeout=30)
+                wav_files  = entry.get("wav_files", [])
+                ffmpeg_bin = entry.get("ffmpeg", "ffmpeg")
+                existing   = [w for w in wav_files
+                              if os.path.exists(w) and os.path.getsize(w) > 0]
+                if not existing:
+                    self.after(0, self._log,
+                               "  ⚠ No WAV data captured from any application")
+                elif len(existing) == 1:
+                    self.after(0, self._log, "  Converting WAV → MP3…")
+                    try:
+                        r = subprocess.run(
+                            [ffmpeg_bin, "-y", "-i", existing[0], "-q:a", "2", path],
+                            capture_output=True, timeout=120,
+                            creationflags=subprocess.CREATE_NO_WINDOW,
+                        )
+                        if r.returncode != 0:
+                            err_txt = r.stderr.decode(errors="replace").strip()
+                            self.after(0, self._log,
+                                       f"  ⚠ WAV→MP3 failed: "
+                                       f"{err_txt[-200:] if err_txt else '(no output)'}")
+                    except Exception as exc:
+                        self.after(0, self._log, f"  WAV→MP3 error: {exc}")
+                else:
+                    self.after(0, self._log,
+                               f"  Mixing {len(existing)} stream(s) → MP3…")
+                    mix_cmd = [ffmpeg_bin, "-y"]
+                    for w in existing:
+                        mix_cmd += ["-i", w]
+                    mix_cmd += [
+                        "-filter_complex",
+                        f"amix=inputs={len(existing)}:duration=longest:normalize=0",
+                        "-q:a", "2", path,
+                    ]
+                    try:
+                        r = subprocess.run(mix_cmd, capture_output=True, timeout=120,
+                                           creationflags=subprocess.CREATE_NO_WINDOW)
+                        if r.returncode != 0:
+                            err_txt = r.stderr.decode(errors="replace").strip()
+                            self.after(0, self._log,
+                                       f"  ⚠ WAV mix failed: "
+                                       f"{err_txt[-200:] if err_txt else '(no output)'}")
+                    except Exception as exc:
+                        self.after(0, self._log, f"  WAV mix error: {exc}")
+                for w in wav_files:
+                    try:
+                        os.remove(w)
+                    except Exception:
+                        pass
+
+            elif entry.get("stop_evt"):  # ── WASAPI device loopback ──
                 t = entry.get("thread")
                 if t:
                     t.join(timeout=15)
@@ -2493,8 +3652,8 @@ class PinballRecorder(tk.Tk):
                             self.after(0, self._log,
                                        f"  ⚠ WAV→MP3 failed (code {r.returncode}): "
                                        f"{err_txt[-200:] if err_txt else '(no output)'}")
-                    except Exception as e:
-                        self.after(0, self._log, f"  WAV→MP3 error: {e}")
+                    except Exception as exc:
+                        self.after(0, self._log, f"  WAV→MP3 error: {exc}")
                     finally:
                         try:
                             os.remove(wav)
@@ -2628,6 +3787,67 @@ class PinballRecorder(tk.Tk):
 # ─── Entry Point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    # ── Internal audio-capture subprocess mode ─────────────────────────────────
+    # Invoked by _app_loopback_subprocess to run capture in a fresh process.
+    # argv: <script> --capture-audio <pid> <wav_path> <duration> <stop_file>
+    if len(sys.argv) >= 6 and sys.argv[1] == "--capture-audio":
+        import time as _time_mod
+
+        _pid      = int(sys.argv[2])
+        _wav      = sys.argv[3]
+        _dur      = float(sys.argv[4])
+        _stopfile = sys.argv[5]
+
+        _stop = threading.Event()
+
+        def _watch_stop():
+            while not _stop.is_set():
+                if os.path.exists(_stopfile):
+                    _stop.set()
+                    return
+                _time_mod.sleep(0.25)
+
+        threading.Thread(target=_watch_stop, daemon=True).start()
+
+        def _log(m): print(m, flush=True)
+
+        # Try the specified PID first; if the Windows audio engine returns
+        # ERROR_FILE_NOT_FOUND (0x80070002) it means no active loopback endpoint
+        # exists for that process tree.  This can happen when:
+        #   - the target process hasn't produced audio yet (session not yet open)
+        #   - the app's Audio Service runs under a different child PID
+        # Fallback: try each direct child process in order.
+        _ERROR_NOT_FOUND = "0x80070002"
+        _pids_to_try = [_pid] + _get_child_pids(_pid)
+        _last_err = None
+        _captured = False
+
+        for _try_pid in _pids_to_try:
+            if _stop.is_set():
+                break
+            if _try_pid != _pid:
+                _log(f"  trying child PID {_try_pid}")
+            try:
+                _app_loopback_capture(_try_pid, _wav, _stop, _dur, on_log=_log)
+                _captured = True
+                break
+            except RuntimeError as _e:
+                _last_err = str(_e)
+                if _ERROR_NOT_FOUND not in _last_err:
+                    break  # unexpected error — don't try other PIDs
+
+        if not _captured and _last_err and not _stop.is_set():
+            if _ERROR_NOT_FOUND in _last_err:
+                _log("  ! No active audio session found for this app or its children.")
+                _log("    Ensure the application is actively playing audio when recording starts.")
+                _log("    For browser audio, try WASAPI loopback mode instead.")
+            else:
+                _log(f"  ERROR: {_last_err}")
+
+        # os._exit skips Python/tkinter cleanup that can block indefinitely
+        # when Tcl/Tk is imported but never fully initialised in this process.
+        os._exit(0)
+
     import argparse
 
     parser = argparse.ArgumentParser(

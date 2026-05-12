@@ -42,7 +42,7 @@ A **Destination Preview** grid appears showing the exact output paths:
 |--------|-------------|
 | Playfield | `{MediaDir}/PlayField/{ROM}.mp4` |
 | Backglass | `{MediaDir}/BackGlass/{ROM}.mp4` |
-| FullDMD | `{MediaDir}/DMD/{ROM}.mp4` |
+| FullDMD | `{MediaDir}/Menu/{ROM}.mp4` |
 | Audio | `{MediaDir}/Audio/{ROM}.mp3` |
 
 ### Step 3: Record
@@ -172,19 +172,17 @@ Shell "C:\vPinball\PinballRecorder\PinballRecorder.exe --autostart --rom tz_ps3 
 
 ## Example Config
 
+`configs/default_config.json` (per-session settings):
+
 ```json
 {
   "output_folder": "C:\\vPinball\\PinUPSystem\\PupCapture",
   "file_prefix": "pinball",
-  "ffmpeg_path": "C:\\vPinball\\PinballRecorder\\ffmpeg.exe",
   "audio_enabled": true,
   "audio_device": "[Loopback] Speakers (USB Device)",
   "audio_delay": 0,
   "audio_duration": 0,
   "audio_match_screen": "Playfield",
-  "open_folder_after": false,
-  "log_to_file": true,
-  "pinup_db_path": "C:\\vPinball\\PinUPSystem\\PUPDatabase.db",
   "pinup_game_rom": "tz_ps3",
   "pinup_game_media_dir": "C:\\vPinball\\PinUPSystem\\POPMedia\\Visual Pinball X",
   "pinup_also_save": false,
@@ -198,15 +196,26 @@ Shell "C:\vPinball\PinballRecorder\PinballRecorder.exe --autostart --rom tz_ps3 
     "Backglass": {
       "enabled": true,
       "monitor": "Monitor 2",
-      "x": 1920, "y": 0, "width": 1280, "height": 720,
+      "x": 0, "y": 0, "width": 1280, "height": 720,
       "fps": 30, "delay": 5, "duration": 30
     },
     "FullDMD": {
       "enabled": true,
       "monitor": "Monitor 2",
-      "x": 3200, "y": 900, "width": 1280, "height": 180,
+      "x": 0, "y": 900, "width": 1280, "height": 180,
       "fps": 30, "delay": 5, "duration": 30
     }
   }
+}
+```
+
+`global.json` (global preferences — edit via **File → Preferences…**):
+
+```json
+{
+  "ffmpeg_path": "C:\\vPinball\\PinballRecorder\\ffmpeg.exe",
+  "pinup_db_path": "C:\\vPinball\\PinUPSystem\\PUPDatabase.db",
+  "open_folder_after": false,
+  "log_to_file": true
 }
 ```

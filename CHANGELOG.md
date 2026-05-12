@@ -3,6 +3,14 @@
 ## [Unreleased]
 
 ### Added
+
+### Changed
+
+### Fixed
+
+## [v2.2.0] - 2026-05-11
+
+### Added
 - **Application Audio Capture mode**: audio can now be captured directly from one or more specific application windows using the Windows Application Loopback API (Windows 10 2004 / build 19041+). This bypasses the system master volume entirely, so recordings are always at full amplitude regardless of how low the cabinet speakers are set. Select "Application" under Capture Mode in the Audio section, then pick one or more windows from the list. Multiple selections are mixed into a single MP3 using FFmpeg's `amix` filter.
 - **Right-click to ignore an app in the Application audio list**: right-clicking any window in the Application capture listbox shows a context menu with "Ignore — hide from list". The exe name is saved to `global.json` and the list refreshes immediately. A "Manage ignored apps…" shortcut opens Preferences.
 - **Ignored Audio Apps in Preferences**: File → Preferences now has an "IGNORED AUDIO APPS" section listing every suppressed exe. Individual entries can be removed; "Restore Defaults" resets the list to the built-in set of known-incompatible apps (Chromium browsers, Discord, Windows Media Player, Explorer).

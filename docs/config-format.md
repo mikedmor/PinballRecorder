@@ -24,9 +24,6 @@ These fields are saved and loaded with each config profile:
   // Ignored (greyed out) when a PinUP table is selected and "Also keep copies" is off
   "file_prefix": "pinball",
 
-  // Full path to ffmpeg.exe (empty = auto-detect)
-  "ffmpeg_path": "",
-
   // Whether to record system audio to a separate MP3
   "audio_enabled": true,
 
@@ -62,8 +59,8 @@ These fields are saved and loaded with each config profile:
     "Playfield": {
       "enabled": true,
       "monitor": "Monitor 1",   // Label only — informational
-      "x": 0,                   // Left edge of capture region (pixels, virtual desktop)
-      "y": 0,                   // Top edge of capture region
+      "x": 0,                   // Left edge of capture region (pixels, relative to monitor's top-left)
+      "y": 0,                   // Top edge of capture region (relative to monitor's top-left)
       "width": 1920,
       "height": 1080,
       "fps": 30,                // Frames per second
@@ -98,7 +95,6 @@ These fields are saved and loaded with each config profile:
 |-------|------|---------|-------------|
 | `output_folder` | string | `C:\vPinball\PinUPSystem\PupCapture` | Folder where recordings are saved (temp folder in PinUP mode) |
 | `file_prefix` | string | `pinball` | Prefix for output filenames |
-| `ffmpeg_path` | string | `""` | Path to `ffmpeg.exe` (empty = auto-detect) |
 | `audio_enabled` | bool | `true` | Whether to record system audio |
 | `audio_device` | string | `""` | Audio capture device name |
 | `audio_delay` | int | `0` | Seconds before starting audio capture |
@@ -110,7 +106,7 @@ These fields are saved and loaded with each config profile:
 | `pinup_also_save` | bool | `false` | Copy files to POPMedia and keep originals in output folder |
 | `screens` | object | — | Per-screen configuration (see below) |
 
-> `open_folder_after`, `log_to_file`, `pinup_db_path`, and `recent_files` are **global preferences** — they live in `global.json` only and are not saved per config profile. Edit them via **File → Preferences…**.
+> `ffmpeg_path`, `open_folder_after`, `log_to_file`, `pinup_db_path`, and `recent_files` are **global preferences** — they live in `global.json` only and are not saved per config profile. Edit them via **File → Preferences…**.
 
 ### Per-screen fields (inside `"screens"`)
 
@@ -118,8 +114,8 @@ These fields are saved and loaded with each config profile:
 |-------|------|---------|-------------|
 | `enabled` | bool | `true` | Whether to record this screen |
 | `monitor` | string | `""` | Monitor label (informational only) |
-| `x` | int | `0` | X coordinate of the capture region (virtual desktop pixels) |
-| `y` | int | `0` | Y coordinate of the capture region |
+| `x` | int | `0` | X offset of the capture region from the selected monitor's left edge |
+| `y` | int | `0` | Y offset of the capture region from the selected monitor's top edge |
 | `width` | int | `1920` | Width of the capture region in pixels |
 | `height` | int | `1080` | Height of the capture region in pixels |
 | `fps` | int | `30` | Frames per second for this stream |
@@ -130,7 +126,7 @@ These fields are saved and loaded with each config profile:
 
 ## Notes
 
-- **Coordinates** use the Windows virtual desktop coordinate system. Use the **🖥 Preview** overlays in the GUI to find the right values visually.
+- **Coordinates** (`x`, `y`) are relative to the selected monitor's top-left corner — X=0, Y=0 means the monitor's origin regardless of where it sits in the desktop layout. Use the **🖥 Preview** overlays in the GUI to find the right values visually. Old configs using absolute desktop coordinates are migrated automatically on first load.
 - **Duration = 0** in `--autostart` (headless) mode means the stream records indefinitely — always set a non-zero duration when using automated mode.
 - **Audio match screen** defaults to `"Playfield"`. When set, the audio delay and duration fields are disabled and mirror the selected screen's values automatically.
 - **PinUP fields** (`pinup_game_rom`, `pinup_game_media_dir`) are populated automatically when you select a table in the GUI; you do not need to set them manually.
@@ -144,6 +140,9 @@ These settings are shared across all config profiles and are **not** stored in s
 
 ```jsonc
 {
+  // Full path to ffmpeg.exe (empty = auto-detect next to the exe, then PATH)
+  "ffmpeg_path": "",
+
   // Path to PUPDatabase.db (auto-detected on startup if empty)
   "pinup_db_path": "C:/vPinball/PinUPSystem/PUPDatabase.db",
 
@@ -154,13 +153,18 @@ These settings are shared across all config profiles and are **not** stored in s
   "open_folder_after": false,
 
   // Last 8 opened config files (managed automatically by the app)
-  "recent_files": []
+  "recent_files": [],
+
+  // Exe names hidden from the Application audio capture list (right-click an entry to add)
+  "ignored_audio_apps": ["brave.exe", "chrome.exe", "discord.exe", "..."]
 }
 ```
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
+| `ffmpeg_path` | string | `""` | Path to `ffmpeg.exe`; auto-detected on startup if empty |
 | `pinup_db_path` | string | `""` | Path to `PUPDatabase.db`; auto-detected on startup |
 | `log_to_file` | bool | `false` | Write session log to `PinballRecorder.log` |
 | `open_folder_after` | bool | `false` | Open output/media folder in Explorer after recording |
 | `recent_files` | array | `[]` | Paths of recently opened config files (max 8) |
+| `ignored_audio_apps` | array | *(built-in list)* | Exe names hidden from the Application audio capture list; manage via right-click or **File → Preferences…** |

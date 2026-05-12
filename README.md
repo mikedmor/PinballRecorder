@@ -10,7 +10,7 @@ Built with Python + tkinter. Distributed as a single `.exe` with no installation
 
 - **Multi-screen simultaneous recording** — Playfield, Backglass, and FullDMD each saved to their own MP4
 - **Per-screen configuration** — individual FPS, start delay, and duration per screen
-- **System audio capture** — records system audio via WASAPI loopback, with per-audio delay, duration, and "match screen" options
+- **System audio capture** — WASAPI loopback (captures all system audio) or Application mode (captures a specific app directly, bypassing system volume); with per-audio delay, duration, and "match screen" options
 - **Visual preview overlays** — drag and resize live overlays to set capture regions precisely
 - **Monitor auto-detection** — automatically maps screens to connected monitors on first run
 - **Named config profiles** — File → New / Open / Save / Save As to manage multiple config files (e.g. per-table or per-emulator)
@@ -47,7 +47,7 @@ On first run with no saved config, monitors are auto-detected and assigned to sc
 |--------|-------------|
 | On | Enable/disable this screen |
 | Monitor | Which monitor this screen maps to |
-| X / Y | Top-left coordinate of the capture region |
+| X / Y | Top-left offset of the capture region, relative to the selected monitor's top-left corner |
 | Width / Height | Size of the capture region |
 | FPS | Frame rate (default: 30; set Playfield to 60 for smoother video) |
 | Delay(s) | Seconds to wait before starting this stream |
@@ -59,9 +59,20 @@ Use the **🖥 Preview** button to open a live draggable/resizable overlay to se
 
 ## Audio Capture
 
-Audio is recorded to a separate MP3 file using **WASAPI loopback** — this captures whatever your speakers are playing, from any application.
+Two capture modes are available under **Capture Mode** in the Audio section:
 
-- **Capture Device** — select a `[Loopback]` device from the dropdown (e.g. `[Loopback] Speakers (USB Device)`)
+### WASAPI Loopback (default)
+
+Captures whatever your speakers are playing system-wide. Select a `[Loopback]` device from the **Capture Device** dropdown (e.g. `[Loopback] Speakers (USB Device)`).
+
+### Application Audio
+
+Captures audio directly from one or more specific application windows using the Windows Application Loopback API (Windows 10 build 19041+). This bypasses the system master volume entirely, so recordings are always at full amplitude regardless of speaker volume. Select "Application" under Capture Mode, then pick one or more windows from the list while those apps are playing audio.
+
+- Apps that are incompatible with direct capture (Chromium-based browsers, Discord, Windows Media Player, Steam, etc.) are hidden from the list by default. **Right-click** any entry to ignore it; manage the ignore list in **File → Preferences…** under IGNORED AUDIO APPS.
+
+### Common audio options
+
 - **Delay (s)** — seconds to wait before starting audio capture
 - **Duration (s)** — how long to record audio (0 = auto-match the longest enabled screen)
 - **Match screen** — mirror a specific screen's delay and duration (defaults to **Playfield**); disables the manual delay/duration fields while active
@@ -104,10 +115,12 @@ The following settings are **global** — shared across all config profiles and 
 
 | Setting | Description |
 |---------|-------------|
+| FFmpeg path | Path to `ffmpeg.exe` (auto-detected on startup) |
 | PinUP Database path | Path to `PUPDatabase.db` (auto-detected on startup) |
 | Open output folder after recording | Opens the output folder (or PinUP media dir) in Explorer when recording finishes |
 | Save session log | Write a session log to `PinballRecorder.log` (always on in headless mode) |
 | Recent files | List of recently opened config files (clearable) |
+| Ignored Audio Apps | Exe names hidden from the Application audio capture list; add via right-click, remove here |
 
 ---
 
@@ -121,7 +134,7 @@ PinballRecorder has a built-in **PinUP Popper Integration** section:
 4. **After recording** — files are automatically moved into the correct POPMedia folder structure:
    - `{MediaDir}/PlayField/{ROM}.mp4`
    - `{MediaDir}/BackGlass/{ROM}.mp4`
-   - `{MediaDir}/DMD/{ROM}.mp4`
+   - `{MediaDir}/Menu/{ROM}.mp4`
    - `{MediaDir}/Audio/{ROM}.mp3`
 5. **Conflict handling** — if a capture already exists, choose to Overwrite, Append (numbered suffix), or Skip
 6. **Also keep copies** — optionally copy files to POPMedia *and* keep originals in the Output Folder
